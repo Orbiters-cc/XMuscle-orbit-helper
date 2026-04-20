@@ -1,0 +1,1419 @@
+bl_info = {
+    "name": "xmuscles orbit helper",
+    "author": "OpenAI Codex",
+    "version": (0, 3, 0),
+    "blender": (5, 0, 0),
+    "location": "View3D > Sidebar > X-Muscles Orbit",
+    "description": "Muscle-centric helper for baking and rebaking X-Muscle deformation into shape keys",
+    "category": "Object",
+}
+
+import math
+import json
+from contextlib import contextmanager
+
+import bpy
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, FloatVectorProperty, IntProperty, PointerProperty, StringProperty
+from mathutils import Euler, Matrix, Quaternion, Vector
+
+
+SUPPORTED_DEFORMATION_MODIFIERS = {
+    "ARMATURE",
+    "CAST",
+    "CORRECTIVE_SMOOTH",
+    "CURVE",
+    "DISPLACE",
+    "HOOK",
+    "LAPLACIANDEFORM",
+    "LATTICE",
+    "MESH_DEFORM",
+    "SHRINKWRAP",
+    "SIMPLE_DEFORM",
+    "SMOOTH",
+    "SURFACE_DEFORM",
+    "WARP",
+    "WAVE",
+}
+
+
+AXIS_ITEMS = (
+    ("X", "X", "Fallback axis used only when no captured start/end poses exist"),
+    ("Y", "Y", "Fallback axis used only when no captured start/end poses exist"),
+    ("Z", "Z", "Fallback axis used only when no captured start/end poses exist"),
+)
+
+
+CAPTURE_ITEMS = (
+    ("START", "Start", "Capture the current bone pose as the start pose"),
+    ("END", "End", "Capture the current bone pose as the end pose"),
+)
+
+
+MUSCLE_SETTINGS_PROP = "_xmoh_settings"
+
+
+def iter_linked_muscles(body_obj):
+    muscles = []
+    if body_obj is None or body_obj.type != "MESH":
+        return muscles
+
+    seen = set()
+    for modifier in body_obj.modifiers:
+        target = getattr(modifier, "target", None)
+        if modifier.type != "SHRINKWRAP" or target is None:
+            continue
+        if not getattr(target, "Muscle_XID", False):
+            continue
+        if target.name in seen:
+            continue
+        muscles.append(target)
+        seen.add(target.name)
+    return muscles
+
+
+def linked_muscle_items(_self, context):
+    settings = context.scene.xmuscle_range_baker
+    muscles = iter_linked_muscles(settings.body_object)
+    if not muscles:
+        return [("__NONE__", "No linked muscles found", "Apply X-Muscles to the body first")]
+    return [(obj.name, obj.name, "") for obj in muscles]
+
+
+def iter_scene_muscles(scene):
+    return [obj for obj in scene.objects if obj.type == "MESH" and getattr(obj, "Muscle_XID", False)]
+
+
+def get_muscle_controller(muscle_obj):
+    if muscle_obj is None or muscle_obj.parent is None or muscle_obj.parent.type != "ARMATURE":
+        return None
+
+    for pose_bone in muscle_obj.parent.pose.bones:
+        for constraint in pose_bone.constraints:
+            target = getattr(constraint, "target", None)
+            if target and target.type == "EMPTY":
+                return target
+    return None
+
+
+def infer_body_for_muscle(scene, muscle_obj):
+    if muscle_obj is None:
+        return None
+    for obj in scene.objects:
+        if obj.type != "MESH" or getattr(obj, "Muscle_XID", False):
+            continue
+        for modifier in obj.modifiers:
+            if modifier.type == "SHRINKWRAP" and getattr(modifier, "target", None) == muscle_obj:
+                return obj
+    return None
+
+
+def infer_links_for_muscle(scene, muscle_obj):
+    body_obj = infer_body_for_muscle(scene, muscle_obj)
+    rig_obj = muscle_obj.parent if muscle_obj and muscle_obj.parent and muscle_obj.parent.type == "ARMATURE" else None
+    bone_name = getattr(muscle_obj, "parent_bone", "") if muscle_obj else ""
+
+    if not rig_obj or not bone_name:
+        controller = get_muscle_controller(muscle_obj)
+        rig_obj = controller.parent if controller and controller.parent and controller.parent.type == "ARMATURE" else rig_obj
+        bone_name = controller.parent_bone if controller and not bone_name else bone_name
+    return {
+        "body_object_name": body_obj.name if body_obj else "",
+        "rig_object_name": rig_obj.name if rig_obj else "",
+        "bone_name": bone_name,
+    }
+
+
+def get_saved_prefix_for_muscle(muscle_obj, default_prefix):
+    if muscle_obj is None:
+        return default_prefix
+    payload = muscle_obj.get(MUSCLE_SETTINGS_PROP)
+    if not payload:
+        return default_prefix
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return default_prefix
+    return data.get("key_prefix", default_prefix) or default_prefix
+
+
+def muscle_has_baked_keys(scene, muscle_obj, prefix):
+    body_obj = infer_body_for_muscle(scene, muscle_obj)
+    if body_obj is None or body_obj.data.shape_keys is None:
+        return False
+    token = sanitize_key_token(muscle_obj.name)
+    expected_prefix = f"{prefix}{token}_"
+    return any(key.name.startswith(expected_prefix) for key in body_obj.data.shape_keys.key_blocks if key.name != "Basis")
+
+
+def get_settings(context=None):
+    context = context or bpy.context
+    scene = getattr(context, "scene", None)
+    if scene is None or not hasattr(scene, "xmuscle_range_baker"):
+        return None
+    return scene.xmuscle_range_baker
+
+
+def get_selected_scene_muscle(settings):
+    if not settings or not settings.muscle_name or settings.muscle_name == "__NONE__":
+        return None
+    return bpy.data.objects.get(settings.muscle_name)
+
+
+def serialize_settings(settings):
+    return {
+        "body_object_name": settings.body_object.name if settings.body_object else "",
+        "rig_object_name": settings.rig_object.name if settings.rig_object else "",
+        "bone_name": settings.bone_name,
+        "rotation_axis": settings.rotation_axis,
+        "start_angle": settings.start_angle,
+        "end_angle": settings.end_angle,
+        "samples": settings.samples,
+        "key_prefix": settings.key_prefix,
+        "replace_existing": settings.replace_existing,
+        "disable_subsurf": settings.disable_subsurf,
+        "auto_apply_muscle": settings.auto_apply_muscle,
+        "auto_disable_unsupported_modifiers": settings.auto_disable_unsupported_modifiers,
+        "use_captured_pose": settings.use_captured_pose,
+        "has_start_pose": settings.has_start_pose,
+        "has_end_pose": settings.has_end_pose,
+        "start_quaternion": list(settings.start_quaternion),
+        "end_quaternion": list(settings.end_quaternion),
+        "preview_enabled": settings.preview_enabled,
+        "preview_factor": settings.preview_factor,
+        "preview_restore_quaternion": list(settings.preview_restore_quaternion),
+        "auto_generate_animation": settings.auto_generate_animation,
+        "mute_live_xmuscle": settings.mute_live_xmuscle,
+        "animation_start_frame": settings.animation_start_frame,
+        "animation_length": settings.animation_length,
+    }
+
+
+def save_selected_muscle_settings(settings):
+    muscle_obj = get_selected_scene_muscle(settings)
+    if muscle_obj is None:
+        return
+    muscle_obj[MUSCLE_SETTINGS_PROP] = json.dumps(serialize_settings(settings))
+
+
+def apply_saved_settings(settings, payload):
+    settings.sync_settings_lock = True
+    try:
+        body_name = payload.get("body_object_name", "")
+        rig_name = payload.get("rig_object_name", "")
+        settings.body_object = bpy.data.objects.get(body_name) if body_name else None
+        settings.rig_object = bpy.data.objects.get(rig_name) if rig_name else None
+        settings.bone_name = payload.get("bone_name", "")
+        settings.rotation_axis = payload.get("rotation_axis", settings.rotation_axis)
+        settings.start_angle = payload.get("start_angle", settings.start_angle)
+        settings.end_angle = payload.get("end_angle", settings.end_angle)
+        settings.samples = payload.get("samples", settings.samples)
+        settings.key_prefix = payload.get("key_prefix", settings.key_prefix)
+        settings.replace_existing = payload.get("replace_existing", settings.replace_existing)
+        settings.disable_subsurf = payload.get("disable_subsurf", settings.disable_subsurf)
+        settings.auto_apply_muscle = payload.get("auto_apply_muscle", settings.auto_apply_muscle)
+        settings.auto_disable_unsupported_modifiers = payload.get("auto_disable_unsupported_modifiers", settings.auto_disable_unsupported_modifiers)
+        settings.use_captured_pose = payload.get("use_captured_pose", settings.use_captured_pose)
+        settings.has_start_pose = payload.get("has_start_pose", settings.has_start_pose)
+        settings.has_end_pose = payload.get("has_end_pose", settings.has_end_pose)
+        settings.start_quaternion = payload.get("start_quaternion", list(settings.start_quaternion))
+        settings.end_quaternion = payload.get("end_quaternion", list(settings.end_quaternion))
+        settings.preview_enabled = payload.get("preview_enabled", False)
+        settings.preview_factor = payload.get("preview_factor", settings.preview_factor)
+        settings.preview_restore_quaternion = payload.get("preview_restore_quaternion", list(settings.preview_restore_quaternion))
+        settings.auto_generate_animation = payload.get("auto_generate_animation", settings.auto_generate_animation)
+        settings.mute_live_xmuscle = payload.get("mute_live_xmuscle", False)
+        settings.animation_start_frame = payload.get("animation_start_frame", settings.animation_start_frame)
+        settings.animation_length = payload.get("animation_length", settings.animation_length)
+    finally:
+        settings.sync_settings_lock = False
+
+
+def load_settings_for_muscle(settings, muscle_obj):
+    payload = {}
+    if muscle_obj is not None and muscle_obj.get(MUSCLE_SETTINGS_PROP):
+        try:
+            payload = json.loads(muscle_obj[MUSCLE_SETTINGS_PROP])
+        except json.JSONDecodeError:
+            payload = {}
+    if not payload:
+        payload = infer_links_for_muscle(bpy.context.scene, muscle_obj)
+    else:
+        inferred = infer_links_for_muscle(bpy.context.scene, muscle_obj)
+        payload.setdefault("body_object_name", inferred.get("body_object_name", ""))
+        payload.setdefault("rig_object_name", inferred.get("rig_object_name", ""))
+        payload.setdefault("bone_name", inferred.get("bone_name", ""))
+    apply_saved_settings(settings, payload)
+    save_selected_muscle_settings(settings)
+
+
+def ensure_object_mode(context):
+    active = context.view_layer.objects.active
+    if active and active.mode != "OBJECT":
+        bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def settings_changed(self, _context):
+    if getattr(self, "sync_settings_lock", False):
+        return
+    save_selected_muscle_settings(self)
+
+
+def make_object_active(context, obj):
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+
+
+def find_muscle_by_name(body_obj, muscle_name):
+    for muscle in iter_linked_muscles(body_obj):
+        if muscle.name == muscle_name:
+            return muscle
+    return None
+
+
+def iter_body_xmuscle_modifiers(body_obj):
+    if body_obj is None or body_obj.type != "MESH":
+        return []
+
+    result = []
+    for modifier in body_obj.modifiers:
+        if modifier.type == "SHRINKWRAP" and getattr(getattr(modifier, "target", None), "Muscle_XID", False):
+            result.append(modifier)
+        elif modifier.name == "XMSL_SkinCorrector" and modifier.type == "CORRECTIVE_SMOOTH":
+            result.append(modifier)
+    return result
+
+
+def snapshot_xmuscle_live_state(body_obj):
+    state = {
+        "body": {},
+        "muscles": {},
+    }
+    if body_obj is not None:
+        for attr in ("Skin_Corrector_View3D", "Skin_Corrector_Render"):
+            if hasattr(body_obj, attr):
+                state["body"][attr] = getattr(body_obj, attr)
+
+    for muscle in iter_linked_muscles(body_obj):
+        state["muscles"][muscle.name] = {
+            "Muscle_View3D": getattr(muscle, "Muscle_View3D", True),
+            "Muscle_Render": getattr(muscle, "Muscle_Render", True),
+            "Micro_Controller_View3D": getattr(muscle, "Micro_Controller_View3D", False),
+            "Micro_Controller_Render": getattr(muscle, "Micro_Controller_Render", False),
+        }
+    return state
+
+
+def restore_xmuscle_live_state(body_obj, state):
+    if body_obj is not None:
+        for attr, value in state.get("body", {}).items():
+            if hasattr(body_obj, attr):
+                setattr(body_obj, attr, value)
+
+    for muscle in iter_linked_muscles(body_obj):
+        muscle_state = state.get("muscles", {}).get(muscle.name)
+        if not muscle_state:
+            continue
+        for attr, value in muscle_state.items():
+            if hasattr(muscle, attr):
+                setattr(muscle, attr, value)
+
+
+def set_xmuscle_live_state(body_obj, enabled, solo_muscle=None):
+    if body_obj is not None:
+        for attr in ("Skin_Corrector_View3D", "Skin_Corrector_Render"):
+            if hasattr(body_obj, attr):
+                setattr(body_obj, attr, enabled)
+
+    for muscle in iter_linked_muscles(body_obj):
+        is_selected = solo_muscle is not None and muscle.name == solo_muscle.name
+        active = enabled and (solo_muscle is None or is_selected)
+        if hasattr(muscle, "Muscle_View3D"):
+            muscle.Muscle_View3D = active
+        if hasattr(muscle, "Muscle_Render"):
+            muscle.Muscle_Render = active
+        if hasattr(muscle, "Micro_Controller_View3D"):
+            muscle.Micro_Controller_View3D = active and getattr(muscle, "Micro_Controller", False)
+        if hasattr(muscle, "Micro_Controller_Render"):
+            muscle.Micro_Controller_Render = active and getattr(muscle, "Micro_Controller", False)
+
+
+def set_linked_muscles_enabled(body_obj, enabled, solo_muscle=None):
+    for muscle in iter_linked_muscles(body_obj):
+        is_selected = solo_muscle is not None and muscle.name == solo_muscle.name
+        active = enabled and (solo_muscle is None or is_selected)
+        if hasattr(muscle, "Muscle_View3D"):
+            muscle.Muscle_View3D = active
+        if hasattr(muscle, "Muscle_Render"):
+            muscle.Muscle_Render = active
+        if hasattr(muscle, "Micro_Controller_View3D"):
+            muscle.Micro_Controller_View3D = active and getattr(muscle, "Micro_Controller", False)
+        if hasattr(muscle, "Micro_Controller_Render"):
+            muscle.Micro_Controller_Render = active and getattr(muscle, "Micro_Controller", False)
+
+
+def get_driver_rig_from_muscle(muscle_obj):
+    if muscle_obj is None or muscle_obj.parent is None or muscle_obj.parent.type != "ARMATURE":
+        return None
+
+    controller = None
+    for pose_bone in muscle_obj.parent.pose.bones:
+        for constraint in pose_bone.constraints:
+            target = getattr(constraint, "target", None)
+            if target and target.type == "EMPTY":
+                controller = target
+                break
+        if controller:
+            break
+
+    if controller and controller.parent and controller.parent.type == "ARMATURE":
+        return controller.parent
+    return None
+
+
+def sanitize_key_token(text):
+    return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in text).strip("_") or "Muscle"
+
+
+def build_key_name(prefix, muscle_name, index, total):
+    digits = max(2, len(str(total)))
+    token = sanitize_key_token(muscle_name)
+    return f"{prefix}{token}_{index:0{digits}d}"
+
+
+def remove_existing_shape_keys(context, body_obj, prefix):
+    if not body_obj.data.shape_keys:
+        return
+
+    key_blocks = list(body_obj.data.shape_keys.key_blocks)
+    keys_to_remove = [key for key in key_blocks if key.name != "Basis" and key.name.startswith(prefix)]
+    if not keys_to_remove:
+        return
+
+    ensure_object_mode(context)
+    make_object_active(context, body_obj)
+    for key in keys_to_remove:
+        body_obj.active_shape_key_index = body_obj.data.shape_keys.key_blocks.find(key.name)
+        bpy.ops.object.shape_key_remove(all=False)
+
+
+def evaluate_body_vertices(context, body_obj):
+    depsgraph = context.evaluated_depsgraph_get()
+    context.view_layer.update()
+    evaluated = body_obj.evaluated_get(depsgraph)
+    mesh = evaluated.to_mesh(preserve_all_data_layers=False, depsgraph=depsgraph)
+    try:
+        coords = [vertex.co.copy() for vertex in mesh.vertices]
+    finally:
+        evaluated.to_mesh_clear()
+    return coords
+
+
+def snapshot_body_modifiers(body_obj):
+    return {
+        modifier.name: {
+            "show_viewport": modifier.show_viewport,
+            "show_render": modifier.show_render,
+        }
+        for modifier in body_obj.modifiers
+    }
+
+
+def restore_body_modifiers(body_obj, state):
+    for modifier in body_obj.modifiers:
+        if modifier.name in state:
+            modifier.show_viewport = state[modifier.name]["show_viewport"]
+            modifier.show_render = state[modifier.name]["show_render"]
+
+
+def snapshot_body_xmuscle_driver_mute_state(body_obj):
+    state = {}
+    animation_data = getattr(body_obj, "animation_data", None)
+    if animation_data is None:
+        return state
+
+    modifier_names = {modifier.name for modifier in iter_body_xmuscle_modifiers(body_obj)}
+    for fcurve in animation_data.drivers:
+        if not any(fcurve.data_path.startswith(f'modifiers["{name}"]') for name in modifier_names):
+            continue
+        if not (fcurve.data_path.endswith("show_viewport") or fcurve.data_path.endswith("show_render")):
+            continue
+        state[fcurve.data_path] = fcurve.mute
+    return state
+
+
+def set_body_xmuscle_driver_mute_state(body_obj, mute):
+    animation_data = getattr(body_obj, "animation_data", None)
+    if animation_data is None:
+        return
+
+    modifier_names = {modifier.name for modifier in iter_body_xmuscle_modifiers(body_obj)}
+    for fcurve in animation_data.drivers:
+        if not any(fcurve.data_path.startswith(f'modifiers["{name}"]') for name in modifier_names):
+            continue
+        if not (fcurve.data_path.endswith("show_viewport") or fcurve.data_path.endswith("show_render")):
+            continue
+        fcurve.mute = mute
+
+
+def restore_body_xmuscle_driver_mute_state(body_obj, state):
+    animation_data = getattr(body_obj, "animation_data", None)
+    if animation_data is None:
+        return
+
+    for fcurve in animation_data.drivers:
+        if fcurve.data_path in state:
+            fcurve.mute = state[fcurve.data_path]
+
+
+def disable_unsupported_modifiers(body_obj, disable_subsurf):
+    disabled = []
+    for modifier in body_obj.modifiers:
+        if not modifier.show_viewport:
+            continue
+        if modifier.type == "SUBSURF" and disable_subsurf:
+            modifier.show_viewport = False
+            modifier.show_render = False
+            disabled.append(modifier.name)
+            continue
+        if modifier.type not in SUPPORTED_DEFORMATION_MODIFIERS:
+            modifier.show_viewport = False
+            modifier.show_render = False
+            disabled.append(modifier.name)
+    return disabled
+
+
+def snapshot_xmuscle_body_modifiers(body_obj):
+    return {
+        modifier.name: {
+            "show_viewport": modifier.show_viewport,
+            "show_render": modifier.show_render,
+        }
+        for modifier in iter_body_xmuscle_modifiers(body_obj)
+    }
+
+
+def restore_xmuscle_body_modifiers(body_obj, state):
+    for modifier in iter_body_xmuscle_modifiers(body_obj):
+        if modifier.name in state:
+            modifier.show_viewport = state[modifier.name]["show_viewport"]
+            modifier.show_render = state[modifier.name]["show_render"]
+
+
+def set_body_xmuscle_state(body_obj, enabled, solo_muscle=None):
+    for modifier in iter_body_xmuscle_modifiers(body_obj):
+        is_selected_muscle = getattr(getattr(modifier, "target", None), "name", None) == getattr(solo_muscle, "name", None)
+        if modifier.type == "SHRINKWRAP":
+            active = enabled and (solo_muscle is None or is_selected_muscle)
+        else:
+            active = enabled
+        modifier.show_viewport = active
+        modifier.show_render = active
+
+
+def snapshot_selection(context):
+    active = context.view_layer.objects.active
+    selected = [obj for obj in context.selected_objects]
+    return active, selected
+
+
+def restore_selection(context, active, selected):
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in selected:
+        if obj.name in bpy.data.objects:
+            bpy.data.objects[obj.name].select_set(True)
+    if active and active.name in bpy.data.objects:
+        context.view_layer.objects.active = bpy.data.objects[active.name]
+
+
+def snapshot_muscle_display_state(muscles):
+    state = {}
+    for muscle in muscles:
+        state[muscle.name] = {
+            "muscle_view3d": getattr(muscle, "Muscle_View3D", True),
+            "micro_view3d": getattr(muscle, "Micro_Controller_View3D", False),
+            "hide_viewport": muscle.hide_viewport,
+        }
+    return state
+
+
+def restore_muscle_display_state(muscles, state):
+    for muscle in muscles:
+        values = state.get(muscle.name)
+        if not values:
+            continue
+        muscle.Muscle_View3D = values["muscle_view3d"]
+        muscle.Micro_Controller_View3D = values["micro_view3d"]
+        muscle.hide_viewport = values["hide_viewport"]
+
+
+def isolate_single_muscle(muscles, active_muscle):
+    for muscle in muscles:
+        is_active = muscle == active_muscle
+        muscle.Muscle_View3D = is_active
+        muscle.hide_viewport = not is_active
+        if hasattr(muscle, "Micro_Controller_View3D"):
+            muscle.Micro_Controller_View3D = is_active and getattr(muscle, "Micro_Controller", False)
+
+
+def pose_bone_quaternion(pose_bone):
+    if pose_bone.rotation_mode == "QUATERNION":
+        quat = pose_bone.rotation_quaternion.copy()
+    elif pose_bone.rotation_mode == "AXIS_ANGLE":
+        axis_angle = pose_bone.rotation_axis_angle
+        quat = Quaternion(axis_angle[1:4], axis_angle[0])
+    else:
+        quat = pose_bone.rotation_euler.to_quaternion()
+    quat.normalize()
+    return quat
+
+
+def apply_quaternion_to_pose_bone(pose_bone, quat):
+    if pose_bone.rotation_mode == "QUATERNION":
+        pose_bone.rotation_quaternion = quat
+    elif pose_bone.rotation_mode == "AXIS_ANGLE":
+        axis, angle = quat.to_axis_angle()
+        pose_bone.rotation_axis_angle = (angle, axis.x, axis.y, axis.z)
+    else:
+        pose_bone.rotation_euler = quat.to_euler(pose_bone.rotation_mode)
+
+
+def sampled_quaternions(start_quat, end_quat, samples):
+    if samples <= 1:
+        return [end_quat.copy()]
+    result = []
+    for index in range(samples):
+        factor = index / (samples - 1)
+        result.append(start_quat.slerp(end_quat, factor))
+    return result
+
+
+def sampled_angles(start_angle, end_angle, samples):
+    if samples <= 1:
+        return [end_angle]
+    step = (end_angle - start_angle) / (samples - 1)
+    return [start_angle + step * index for index in range(samples)]
+
+
+def get_preview_pose_bone(settings):
+    rig_obj = settings.rig_object
+    if rig_obj is None or rig_obj.type != "ARMATURE":
+        return None
+    if not settings.bone_name or settings.bone_name not in rig_obj.pose.bones:
+        return None
+    return rig_obj.pose.bones[settings.bone_name]
+
+
+def apply_preview(settings, context=None):
+    if settings.preview_update_lock:
+        return
+    pose_bone = get_preview_pose_bone(settings)
+    if pose_bone is None:
+        return
+
+    if settings.preview_enabled:
+        if settings.use_captured_pose and settings.has_start_pose and settings.has_end_pose:
+            start_quat = Quaternion(settings.start_quaternion)
+            end_quat = Quaternion(settings.end_quaternion)
+            quat = start_quat.slerp(end_quat, settings.preview_factor)
+        else:
+            axis_index = {"X": 0, "Y": 1, "Z": 2}[settings.rotation_axis]
+            angle = settings.start_angle + (settings.end_angle - settings.start_angle) * settings.preview_factor
+            euler = pose_bone.rotation_euler.copy() if pose_bone.rotation_mode not in {"QUATERNION", "AXIS_ANGLE"} else Euler((0.0, 0.0, 0.0), "XYZ")
+            euler[axis_index] = angle
+            quat = euler.to_quaternion()
+        apply_quaternion_to_pose_bone(pose_bone, quat)
+    else:
+        quat = Quaternion(settings.preview_restore_quaternion)
+        apply_quaternion_to_pose_bone(pose_bone, quat)
+
+    context = context or bpy.context
+    if context and context.view_layer:
+        context.view_layer.update()
+
+
+def preview_update(self, context):
+    apply_preview(self, context)
+    settings_changed(self, context)
+
+
+def mute_xmuscle_update(self, context):
+    body_obj = self.body_object
+    if body_obj is None or self.mute_update_lock:
+        return
+
+    if self.mute_live_xmuscle:
+        payload = {
+            "live_state": snapshot_xmuscle_live_state(body_obj),
+            "modifier_state": snapshot_xmuscle_body_modifiers(body_obj),
+            "driver_mute_state": snapshot_body_xmuscle_driver_mute_state(body_obj),
+        }
+        self.saved_xmuscle_modifier_state = json.dumps(payload)
+        set_body_xmuscle_driver_mute_state(body_obj, mute=True)
+        set_xmuscle_live_state(body_obj, enabled=False)
+        set_body_xmuscle_state(body_obj, enabled=False)
+    else:
+        if self.saved_xmuscle_modifier_state:
+            try:
+                payload = json.loads(self.saved_xmuscle_modifier_state)
+            except json.JSONDecodeError:
+                payload = {}
+            restore_xmuscle_live_state(body_obj, payload.get("live_state", {}))
+            restore_xmuscle_body_modifiers(body_obj, payload.get("modifier_state", {}))
+            restore_body_xmuscle_driver_mute_state(body_obj, payload.get("driver_mute_state", {}))
+    if context and context.view_layer:
+        context.view_layer.update()
+    settings_changed(self, context)
+
+
+@contextmanager
+def preserved_pose_bone_rotation(pose_bone):
+    original_mode = pose_bone.rotation_mode
+    original_euler = pose_bone.rotation_euler.copy()
+    original_quaternion = pose_bone.rotation_quaternion.copy()
+    original_axis_angle = tuple(pose_bone.rotation_axis_angle)
+    try:
+        yield
+    finally:
+        pose_bone.rotation_mode = original_mode
+        pose_bone.rotation_euler = original_euler
+        pose_bone.rotation_quaternion = original_quaternion
+        pose_bone.rotation_axis_angle = original_axis_angle
+
+
+def ensure_body_shape_keys(context, body_obj):
+    if body_obj.data.shape_keys is None:
+        make_object_active(context, body_obj)
+        body_obj.shape_key_add(name="Basis", from_mix=False)
+
+
+def clear_keyframe_values(key_blocks, frame):
+    for key_block in key_blocks:
+        key_block.value = 0.0
+        key_block.keyframe_insert(data_path="value", frame=frame)
+
+
+def snapshot_shape_key_values(body_obj):
+    if body_obj.data.shape_keys is None:
+        return {}
+    return {key_block.name: key_block.value for key_block in body_obj.data.shape_keys.key_blocks}
+
+
+def restore_shape_key_values(body_obj, values):
+    if body_obj.data.shape_keys is None:
+        return
+    for key_block in body_obj.data.shape_keys.key_blocks:
+        if key_block.name in values:
+            key_block.value = values[key_block.name]
+
+
+def update_mesh_state(ob):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    depsgraph.update()
+    ob.update_tag()
+    bpy.context.view_layer.update()
+    ob.data.update()
+
+
+def corrective_reset_transform(ob):
+    ob.matrix_local.identity()
+
+
+def corrective_extract_vert_coords(verts):
+    return [vertex.co.copy() for vertex in verts]
+
+
+def corrective_extract_mapped_coords(ob):
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eobj = ob.evaluated_get(depsgraph)
+    mesh = bpy.data.meshes.new_from_object(eobj)
+    try:
+        arr = [vertex.co.copy() for vertex in mesh.vertices]
+    finally:
+        mesh.user_clear()
+        bpy.data.meshes.remove(mesh)
+    update_mesh_state(ob)
+    return arr
+
+
+def corrective_apply_vert_coords(ob, mesh, coords):
+    for index, vertex in enumerate(mesh):
+        vertex.co = coords[index]
+    update_mesh_state(ob)
+
+
+def duplicate_flatten_modifiers(context, ob, name):
+    depsgraph = context.evaluated_depsgraph_get()
+    eobj = ob.evaluated_get(depsgraph)
+    mesh = bpy.data.meshes.new_from_object(eobj)
+    new_object = bpy.data.objects.new(name, mesh)
+    context.scene.collection.objects.link(new_object)
+    return new_object
+
+
+def add_corrective_pose_shape(source, target):
+    iterations = 20
+    threshold = 1e-16
+
+    mesh_target = target.data
+    mesh_source = source.data
+
+    original_matrix_local = target.matrix_local.copy()
+    corrective_reset_transform(target)
+
+    if not mesh_target.shape_keys:
+        basis = target.shape_key_add()
+        basis.name = "Basis"
+        update_mesh_state(target)
+        target.active_shape_key_index = 0
+
+    target.show_only_shape_key = False
+    target.active_shape_key_index = 0
+
+    new_shapekey = target.shape_key_add()
+    update_mesh_state(target)
+    target.active_shape_key_index = target.data.shape_keys.key_blocks.find(new_shapekey.name)
+    target.show_only_shape_key = True
+
+    vertex_group = target.active_shape_key.vertex_group
+    target.active_shape_key.vertex_group = ""
+    key_verts = target.active_shape_key.data
+
+    x = corrective_extract_vert_coords(key_verts)
+    target_coords = corrective_extract_vert_coords(mesh_source.vertices)
+
+    for _ in range(iterations):
+        dx = [[], [], [], [], [], []]
+        mapped = corrective_extract_mapped_coords(target)
+
+        for index in range(len(mesh_target.vertices)):
+            epsilon = (target_coords[index] - mapped[index]).length
+            if epsilon < threshold:
+                epsilon = 0.0
+
+            dx[0].append(x[index] + 0.5 * epsilon * Vector((1, 0, 0)))
+            dx[1].append(x[index] + 0.5 * epsilon * Vector((-1, 0, 0)))
+            dx[2].append(x[index] + 0.5 * epsilon * Vector((0, 1, 0)))
+            dx[3].append(x[index] + 0.5 * epsilon * Vector((0, -1, 0)))
+            dx[4].append(x[index] + 0.5 * epsilon * Vector((0, 0, 1)))
+            dx[5].append(x[index] + 0.5 * epsilon * Vector((0, 0, -1)))
+
+        for axis in range(6):
+            corrective_apply_vert_coords(target, key_verts, dx[axis])
+            dx[axis] = corrective_extract_mapped_coords(target)
+
+        for index in range(len(mesh_target.vertices)):
+            epsilon = (target_coords[index] - mapped[index]).length
+            if epsilon < threshold:
+                continue
+            gx = list((dx[0][index] - dx[1][index]) / epsilon)
+            gy = list((dx[2][index] - dx[3][index]) / epsilon)
+            gz = list((dx[4][index] - dx[5][index]) / epsilon)
+            gradient = Matrix((gx, gy, gz))
+            delta = target_coords[index] - mapped[index]
+            x[index] += gradient @ delta
+
+        corrective_apply_vert_coords(target, key_verts, x)
+
+    target.active_shape_key.vertex_group = vertex_group
+    target.active_shape_key.value = 1.0
+    target.show_only_shape_key = False
+    update_mesh_state(target)
+    target.matrix_local = original_matrix_local
+    return target.active_shape_key
+
+
+def remove_temporary_object(obj):
+    if obj is None:
+        return
+    mesh = obj.data
+    bpy.data.objects.remove(obj, do_unlink=True)
+    if mesh and mesh.users == 0:
+        bpy.data.meshes.remove(mesh)
+
+
+def mute_existing_nla_tracks(animation_data):
+    if animation_data is None:
+        return
+    for track in animation_data.nla_tracks:
+        track.mute = True
+
+
+def generate_preview_animation(settings, body_obj, rig_obj, pose_bone, sampled_rots, key_names):
+    scene = bpy.context.scene
+    start_frame = settings.animation_start_frame
+    end_frame = start_frame + max(1, settings.animation_length)
+    total_keys = max(1, len(key_names))
+
+    sample_frames = []
+    for index in range(total_keys):
+        if total_keys == 1:
+            frame = end_frame
+        else:
+            frame = round(start_frame + (end_frame - start_frame) * (index / (total_keys - 1)))
+        sample_frames.append(frame)
+
+    shape_keys = body_obj.data.shape_keys
+    if shape_keys.animation_data is None:
+        shape_keys.animation_data_create()
+    mute_existing_nla_tracks(shape_keys.animation_data)
+    action_name = f"{settings.key_prefix}{sanitize_key_token(body_obj.name)}_ShapePreview"
+    shape_action = bpy.data.actions.new(name=action_name)
+    shape_keys.animation_data.action = shape_action
+
+    relevant_keys = [shape_keys.key_blocks[name] for name in key_names if name in shape_keys.key_blocks]
+    for frame in sample_frames:
+        clear_keyframe_values(relevant_keys, frame)
+
+    for frame, key_block in zip(sample_frames, relevant_keys):
+        key_block.value = 1.0
+        key_block.keyframe_insert(data_path="value", frame=frame)
+
+    if rig_obj.animation_data is None:
+        rig_obj.animation_data_create()
+    mute_existing_nla_tracks(rig_obj.animation_data)
+    rig_action = bpy.data.actions.new(name=f"{settings.key_prefix}{sanitize_key_token(rig_obj.name)}_BonePreview")
+    rig_obj.animation_data.action = rig_action
+
+    for frame, quat in zip(sample_frames, sampled_rots):
+        apply_quaternion_to_pose_bone(pose_bone, quat)
+        if pose_bone.rotation_mode == "QUATERNION":
+            pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+        elif pose_bone.rotation_mode == "AXIS_ANGLE":
+            pose_bone.keyframe_insert(data_path="rotation_axis_angle", frame=frame)
+        else:
+            pose_bone.keyframe_insert(data_path="rotation_euler", frame=frame)
+
+    scene.frame_start = min(scene.frame_start, start_frame)
+    scene.frame_end = max(scene.frame_end, end_frame)
+    scene.frame_set(start_frame)
+
+
+class XMRB_Settings(bpy.types.PropertyGroup):
+    sync_settings_lock: BoolProperty(default=False)
+    body_object: PointerProperty(
+        name="Body",
+        type=bpy.types.Object,
+        description="Target body mesh that already receives X-Muscle shrinkwrap deformation",
+        update=settings_changed,
+        poll=lambda _self, obj: obj and obj.type == "MESH" and not getattr(obj, "Muscle_XID", False),
+    )
+    rig_object: PointerProperty(
+        name="Rig",
+        type=bpy.types.Object,
+        description="Armature that drives the pose for the muscle motion",
+        update=settings_changed,
+        poll=lambda _self, obj: obj and obj.type == "ARMATURE",
+    )
+    muscle_name: StringProperty(
+        name="Muscle",
+        description="Currently selected X-Muscle to bake",
+        update=settings_changed,
+    )
+    bone_name: StringProperty(
+        name="Bone",
+        description="Pose bone to animate and sample while baking",
+        update=settings_changed,
+    )
+    rotation_axis: EnumProperty(
+        name="Axis",
+        description="Fallback axis when no captured poses are stored; captured poses are recommended",
+        items=AXIS_ITEMS,
+        default="X",
+        update=settings_changed,
+    )
+    start_angle: FloatProperty(
+        name="Start",
+        description="Fallback start angle used only when no captured start pose exists",
+        default=0.0,
+        subtype="ANGLE",
+        update=preview_update,
+    )
+    end_angle: FloatProperty(
+        name="End",
+        description="Fallback end angle used only when no captured end pose exists",
+        default=math.radians(90.0),
+        subtype="ANGLE",
+        update=preview_update,
+    )
+    samples: IntProperty(
+        name="Samples",
+        description="How many shape keys to create between start and end, inclusive",
+        default=5,
+        min=2,
+        max=128,
+        update=settings_changed,
+    )
+    key_prefix: StringProperty(
+        name="Prefix",
+        description="Prefix used for all generated shape keys and preview actions",
+        default="XMSL_BAKE_",
+        update=settings_changed,
+    )
+    replace_existing: BoolProperty(
+        name="Replace Existing",
+        description="Remove previously generated shape keys that share the same prefix before baking new ones",
+        default=True,
+        update=settings_changed,
+    )
+    disable_subsurf: BoolProperty(
+        name="Disable Subsurf",
+        description="Temporarily disable viewport subdivision modifiers while baking, then restore them automatically",
+        default=True,
+        update=settings_changed,
+    )
+    auto_apply_muscle: BoolProperty(
+        name="Auto-Apply Muscle",
+        description="If the chosen muscle is not yet linked to the body, call X-Muscle's Apply Muscles to Body automatically",
+        default=True,
+        update=settings_changed,
+    )
+    auto_disable_unsupported_modifiers: BoolProperty(
+        name="Auto-Disable Unsupported Modifiers",
+        description="Temporarily disable body modifiers that can change topology or break shape key transfer, then restore them after the bake",
+        default=True,
+        update=settings_changed,
+    )
+    use_captured_pose: BoolProperty(
+        name="Use Captured Poses",
+        description="Use the exact current bone rotations captured as start and end poses instead of manual angle input",
+        default=True,
+        update=preview_update,
+    )
+    has_start_pose: BoolProperty(default=False, update=settings_changed)
+    has_end_pose: BoolProperty(default=False, update=settings_changed)
+    start_quaternion: FloatVectorProperty(
+        name="Start Quaternion",
+        description="Stored start pose rotation in quaternion form",
+        size=4,
+        default=(1.0, 0.0, 0.0, 0.0),
+        update=settings_changed,
+    )
+    end_quaternion: FloatVectorProperty(
+        name="End Quaternion",
+        description="Stored end pose rotation in quaternion form",
+        size=4,
+        default=(1.0, 0.0, 0.0, 0.0),
+        update=settings_changed,
+    )
+    preview_enabled: BoolProperty(
+        name="Live Preview",
+        description="Drive the selected bone in the viewport using the preview slider between captured start and end poses",
+        default=False,
+        update=preview_update,
+    )
+    preview_factor: FloatProperty(
+        name="Preview",
+        description="Viewport preview position between the start pose and the end pose",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
+        update=preview_update,
+    )
+    preview_restore_quaternion: FloatVectorProperty(
+        name="Restore Quaternion",
+        size=4,
+        default=(1.0, 0.0, 0.0, 0.0),
+        update=settings_changed,
+    )
+    preview_update_lock: BoolProperty(default=False)
+    auto_generate_animation: BoolProperty(
+        name="Auto-Generate Preview Animation",
+        description="Create a simple preview action for the bone and generated shape keys after the bake finishes",
+        default=True,
+        update=settings_changed,
+    )
+    mute_live_xmuscle: BoolProperty(
+        name="Mute Live X-Muscle On Body",
+        description="Temporarily disable the body's X-Muscle shrinkwrap and skin-corrector modifiers so you can inspect only the baked shape keys",
+        default=False,
+        update=mute_xmuscle_update,
+    )
+    saved_xmuscle_modifier_state: StringProperty(default="")
+    mute_update_lock: BoolProperty(default=False)
+    animation_start_frame: IntProperty(
+        name="Anim Start",
+        description="First frame of the generated preview animation",
+        default=1,
+        min=1,
+        update=settings_changed,
+    )
+    animation_length: IntProperty(
+        name="Anim Length",
+        description="Duration in frames of the generated preview animation from start pose to end pose",
+        default=24,
+        min=1,
+        update=settings_changed,
+    )
+
+
+class XMRB_OT_guess_rig(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.guess_rig"
+    bl_label = "Guess Rig"
+    bl_description = "Infer the driving rig from the selected X-Muscle"
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        muscle = find_muscle_by_name(settings.body_object, settings.muscle_name)
+        rig = get_driver_rig_from_muscle(muscle)
+        if rig is None:
+            self.report({"WARNING"}, "Could not infer a driving rig from the selected muscle")
+            return {"CANCELLED"}
+        settings.rig_object = rig
+        return {"FINISHED"}
+
+
+class XMRB_OT_select_muscle(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.select_muscle"
+    bl_label = "Select Muscle"
+    bl_description = "Select this muscle and load its saved bake settings"
+
+    muscle_name: StringProperty()
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        muscle_obj = bpy.data.objects.get(self.muscle_name)
+        if muscle_obj is None:
+            self.report({"ERROR"}, "Muscle not found")
+            return {"CANCELLED"}
+
+        settings.sync_settings_lock = True
+        settings.muscle_name = muscle_obj.name
+        settings.sync_settings_lock = False
+        load_settings_for_muscle(settings, muscle_obj)
+
+        bpy.ops.object.select_all(action="DESELECT")
+        muscle_obj.select_set(True)
+        context.view_layer.objects.active = muscle_obj
+        return {"FINISHED"}
+
+
+class XMRB_OT_bake_specific_muscle(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.bake_specific_muscle"
+    bl_label = "Bake Muscle"
+    bl_description = "Select a muscle, load its saved settings, and bake or rebake it"
+
+    muscle_name: StringProperty()
+
+    def execute(self, context):
+        result = bpy.ops.xmuscle_baker.select_muscle(muscle_name=self.muscle_name)
+        if "CANCELLED" in result:
+            return {"CANCELLED"}
+        return bpy.ops.xmuscle_baker.bake_range()
+
+
+class XMRB_OT_capture_pose(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.capture_pose"
+    bl_label = "Capture Pose"
+    bl_description = "Capture the current selected bone rotation as the start pose or end pose"
+
+    target: EnumProperty(items=CAPTURE_ITEMS)
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        pose_bone = get_preview_pose_bone(settings)
+        if pose_bone is None:
+            self.report({"ERROR"}, "Choose a rig and a valid bone before capturing a pose")
+            return {"CANCELLED"}
+
+        quat = pose_bone_quaternion(pose_bone)
+        settings.preview_update_lock = True
+        settings.preview_restore_quaternion = quat[:]
+        if self.target == "START":
+            settings.start_quaternion = quat[:]
+            settings.has_start_pose = True
+            settings.preview_factor = 0.0
+        else:
+            settings.end_quaternion = quat[:]
+            settings.has_end_pose = True
+            settings.preview_factor = 1.0
+        settings.preview_update_lock = False
+        apply_preview(settings, context)
+        save_selected_muscle_settings(settings)
+        return {"FINISHED"}
+
+
+class XMRB_OT_store_preview_base(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.store_preview_base"
+    bl_label = "Store Current As Restore Pose"
+    bl_description = "Store the current bone pose so disabling Live Preview restores it"
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        pose_bone = get_preview_pose_bone(settings)
+        if pose_bone is None:
+            self.report({"ERROR"}, "Choose a rig and a valid bone first")
+            return {"CANCELLED"}
+        settings.preview_restore_quaternion = pose_bone_quaternion(pose_bone)[:]
+        save_selected_muscle_settings(settings)
+        return {"FINISHED"}
+
+
+class XMRB_OT_bake_range(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.bake_range"
+    bl_label = "Bake Muscle Range"
+    bl_description = "Bake one linked X-Muscle deformation into multi-step body shape keys"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        body_obj = settings.body_object
+        rig_obj = settings.rig_object
+
+        if body_obj is None:
+            self.report({"ERROR"}, "Choose a body mesh")
+            return {"CANCELLED"}
+        if rig_obj is None:
+            self.report({"ERROR"}, "Choose the armature that drives the pose")
+            return {"CANCELLED"}
+        if not settings.bone_name or settings.bone_name not in rig_obj.pose.bones:
+            self.report({"ERROR"}, "Choose a valid pose bone on the selected armature")
+            return {"CANCELLED"}
+        if not settings.muscle_name:
+            self.report({"ERROR"}, "Select a muscle from the scene list first")
+            return {"CANCELLED"}
+
+        ensure_object_mode(context)
+        previous_active, previous_selection = snapshot_selection(context)
+
+        muscle = find_muscle_by_name(body_obj, settings.muscle_name)
+        if muscle is None:
+            if not settings.auto_apply_muscle:
+                self.report({"ERROR"}, "The selected muscle is not linked to the body mesh")
+                return {"CANCELLED"}
+            if not hasattr(bpy.ops.muscle, "apply_musculature"):
+                self.report({"ERROR"}, "X-Muscle System is not available; cannot auto-apply muscles to the body")
+                return {"CANCELLED"}
+
+            scene_muscle = bpy.data.objects.get(settings.muscle_name)
+            if scene_muscle is None or not getattr(scene_muscle, "Muscle_XID", False):
+                self.report({"ERROR"}, "The selected X-Muscle could not be found in the scene")
+                return {"CANCELLED"}
+
+            bpy.ops.object.select_all(action="DESELECT")
+            scene_muscle.select_set(True)
+            body_obj.select_set(True)
+            context.view_layer.objects.active = body_obj
+            try:
+                bpy.ops.muscle.apply_musculature()
+            except RuntimeError as exc:
+                self.report({"ERROR"}, f"Failed to auto-apply the muscle to the body: {exc}")
+                return {"CANCELLED"}
+            muscle = find_muscle_by_name(body_obj, settings.muscle_name)
+
+        if muscle is None:
+            self.report({"ERROR"}, "The body mesh still has no shrinkwrap link to that muscle")
+            return {"CANCELLED"}
+
+        ensure_body_shape_keys(context, body_obj)
+        if settings.replace_existing:
+            remove_existing_shape_keys(context, body_obj, settings.key_prefix)
+
+        muscles = iter_linked_muscles(body_obj)
+        display_state = snapshot_muscle_display_state(muscles)
+        modifier_state = snapshot_body_modifiers(body_obj)
+        xmuscle_live_state = snapshot_xmuscle_live_state(body_obj)
+        xmuscle_body_modifier_state = snapshot_xmuscle_body_modifiers(body_obj)
+        xmuscle_driver_mute_state = snapshot_body_xmuscle_driver_mute_state(body_obj)
+        shape_key_values = snapshot_shape_key_values(body_obj)
+        pose_bone = rig_obj.pose.bones[settings.bone_name]
+
+        if settings.use_captured_pose and settings.has_start_pose and settings.has_end_pose:
+            sampled_rots = sampled_quaternions(
+                Quaternion(settings.start_quaternion),
+                Quaternion(settings.end_quaternion),
+                settings.samples,
+            )
+        else:
+            sampled_rots = []
+            for angle in sampled_angles(settings.start_angle, settings.end_angle, settings.samples):
+                axis_index = {"X": 0, "Y": 1, "Z": 2}[settings.rotation_axis]
+                euler = [0.0, 0.0, 0.0]
+                euler[axis_index] = angle
+                sampled_rots.append(Euler(euler, "XYZ").to_quaternion())
+
+        disabled_modifiers = []
+        created_key_names = []
+
+        try:
+            if settings.auto_disable_unsupported_modifiers:
+                disabled_modifiers = disable_unsupported_modifiers(body_obj, settings.disable_subsurf)
+            set_body_xmuscle_driver_mute_state(body_obj, mute=True)
+
+            with preserved_pose_bone_rotation(pose_bone):
+                isolate_single_muscle(muscles, muscle)
+                context.view_layer.update()
+
+                for index, quat in enumerate(sampled_rots, start=1):
+                    apply_quaternion_to_pose_bone(pose_bone, quat)
+                    context.view_layer.update()
+
+                    set_body_xmuscle_state(body_obj, enabled=True, solo_muscle=muscle)
+                    context.view_layer.update()
+                    source_obj = duplicate_flatten_modifiers(
+                        context,
+                        body_obj,
+                        f"{body_obj.name}_xmuscle_bake_{index:03d}",
+                    )
+
+                    try:
+                        set_body_xmuscle_state(body_obj, enabled=False)
+                        context.view_layer.update()
+                        body_obj.active_shape_key_index = 0
+                        generated_shape = add_corrective_pose_shape(source_obj, body_obj)
+                        key_name = build_key_name(settings.key_prefix, muscle.name, index, len(sampled_rots))
+                        generated_shape.name = key_name
+                        generated_shape.slider_min = 0.0
+                        generated_shape.slider_max = 1.0
+                        generated_shape.value = 0.0
+                        created_key_names.append(key_name)
+                    finally:
+                        remove_temporary_object(source_obj)
+
+                if settings.auto_generate_animation and created_key_names:
+                    generate_preview_animation(settings, body_obj, rig_obj, pose_bone, sampled_rots, created_key_names)
+
+        finally:
+            restore_shape_key_values(body_obj, shape_key_values)
+            restore_body_xmuscle_driver_mute_state(body_obj, xmuscle_driver_mute_state)
+            restore_xmuscle_body_modifiers(body_obj, xmuscle_body_modifier_state)
+            restore_xmuscle_live_state(body_obj, xmuscle_live_state)
+            restore_body_modifiers(body_obj, modifier_state)
+            restore_muscle_display_state(muscles, display_state)
+            restore_selection(context, previous_active, previous_selection)
+            context.view_layer.update()
+
+        message = f"Created {len(created_key_names)} shape keys on {body_obj.name}"
+        if disabled_modifiers:
+            message += f"; temporarily disabled and restored: {', '.join(disabled_modifiers)}"
+        save_selected_muscle_settings(settings)
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class XMRB_PT_panel(bpy.types.Panel):
+    bl_label = "xmuscles orbit helper"
+    bl_idname = "XMRB_PT_panel"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "X-Muscles Orbit"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.xmuscle_range_baker
+        muscles = iter_scene_muscles(context.scene)
+
+        col = layout.column(align=True)
+        col.label(text="Scene Muscles")
+        if not muscles:
+            col.label(text="No X-Muscles found")
+            return
+
+        for muscle_obj in muscles:
+            row = col.row(align=True)
+            is_selected = settings.muscle_name == muscle_obj.name
+            label = muscle_obj.name if not is_selected else f"{muscle_obj.name} *"
+            row.label(text=label, icon="FORCE_LENNARDJONES")
+            key_prefix = get_saved_prefix_for_muscle(muscle_obj, settings.key_prefix)
+            bake_op = row.operator(
+                "xmuscle_baker.bake_specific_muscle",
+                text="Rebake" if muscle_has_baked_keys(context.scene, muscle_obj, key_prefix) else "Bake",
+            )
+            bake_op.muscle_name = muscle_obj.name
+            select_op = row.operator("xmuscle_baker.select_muscle", text="Select")
+            select_op.muscle_name = muscle_obj.name
+
+        col.separator()
+        col.label(text="Selected Muscle Settings")
+        if settings.muscle_name:
+            selected_muscle = bpy.data.objects.get(settings.muscle_name)
+            if selected_muscle is not None:
+                col.label(text=selected_muscle.name, icon="FORCE_LENNARDJONES")
+        else:
+            col.label(text="Select a muscle above to edit its saved bake settings")
+        col.prop(settings, "body_object")
+
+        row = col.row(align=True)
+        row.prop(settings, "rig_object")
+        row.operator("xmuscle_baker.guess_rig", text="", icon="EYEDROPPER")
+
+        if settings.rig_object is not None:
+            col.prop_search(settings, "bone_name", settings.rig_object.pose, "bones", text="Bone")
+        else:
+            col.prop(settings, "bone_name")
+
+        col.separator()
+        col.label(text="Motion Capture")
+        col.prop(settings, "use_captured_pose")
+
+        row = col.row(align=True)
+        row.operator("xmuscle_baker.capture_pose", text="Capture Start", icon="IMPORT").target = "START"
+        row.operator("xmuscle_baker.capture_pose", text="Capture End", icon="EXPORT").target = "END"
+        col.operator("xmuscle_baker.store_preview_base", text="Store Current As Restore Pose", icon="ARMATURE_DATA")
+
+        pose_info = col.column(align=True)
+        pose_info.enabled = False
+        pose_info.prop(settings, "has_start_pose", text="Start Pose Captured")
+        pose_info.prop(settings, "has_end_pose", text="End Pose Captured")
+
+        col.separator()
+        col.label(text="Fallback Angles")
+        col.prop(settings, "rotation_axis")
+        col.prop(settings, "start_angle")
+        col.prop(settings, "end_angle")
+
+        col.separator()
+        col.label(text="Preview")
+        col.prop(settings, "preview_enabled")
+        col.prop(settings, "preview_factor", slider=True)
+        col.prop(settings, "mute_live_xmuscle")
+
+        col.separator()
+        col.label(text="Bake Output")
+        col.prop(settings, "samples")
+        col.prop(settings, "key_prefix")
+
+        col.separator()
+        col.label(text="Automatic Helpers")
+        col.prop(settings, "replace_existing")
+        col.prop(settings, "disable_subsurf")
+        col.prop(settings, "auto_disable_unsupported_modifiers")
+        col.prop(settings, "auto_apply_muscle")
+
+        col.separator()
+        col.label(text="Preview Animation")
+        col.prop(settings, "auto_generate_animation")
+        col.prop(settings, "animation_start_frame")
+        col.prop(settings, "animation_length")
+
+        col.separator()
+        col.operator("xmuscle_baker.bake_range", icon="SHAPEKEY_DATA", text="Bake Selected Muscle")
+
+
+CLASSES = (
+    XMRB_Settings,
+    XMRB_OT_guess_rig,
+    XMRB_OT_select_muscle,
+    XMRB_OT_bake_specific_muscle,
+    XMRB_OT_capture_pose,
+    XMRB_OT_store_preview_base,
+    XMRB_OT_bake_range,
+    XMRB_PT_panel,
+)
+
+
+def register():
+    for cls in CLASSES:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.xmuscle_range_baker = PointerProperty(type=XMRB_Settings)
+
+
+def unregister():
+    del bpy.types.Scene.xmuscle_range_baker
+    for cls in reversed(CLASSES):
+        bpy.utils.unregister_class(cls)
+
+
+if __name__ == "__main__":
+    register()
