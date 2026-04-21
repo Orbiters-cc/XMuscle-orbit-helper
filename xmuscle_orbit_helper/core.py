@@ -147,6 +147,20 @@ def muscle_has_baked_keys(scene, muscle_obj, prefix):
     return any(key.name.startswith(expected_prefix) for key in body_obj.data.shape_keys.key_blocks if key.name != "Basis")
 
 
+def muscle_key_prefix(prefix, muscle_name):
+    return f"{prefix}{sanitize_key_token(muscle_name)}_"
+
+
+def preview_action_names(prefix, muscle_obj, body_obj, rig_obj):
+    muscle_token = sanitize_key_token(muscle_obj.name)
+    body_token = sanitize_key_token(body_obj.name) if body_obj else "Body"
+    rig_token = sanitize_key_token(rig_obj.name) if rig_obj else "Rig"
+    return (
+        f"{prefix}{muscle_token}_{body_token}_ShapePreview",
+        f"{prefix}{muscle_token}_{rig_token}_BonePreview",
+    )
+
+
 def get_settings(context=None):
     context = context or bpy.context
     scene = getattr(context, "scene", None)
@@ -172,6 +186,7 @@ def serialize_settings(settings):
         "corrective_iterations": settings.corrective_iterations,
         "key_prefix": settings.key_prefix,
         "replace_existing": settings.replace_existing,
+        "replace_target_on_rebake": settings.replace_target_on_rebake,
         "disable_subsurf": settings.disable_subsurf,
         "auto_apply_muscle": settings.auto_apply_muscle,
         "auto_disable_unsupported_modifiers": settings.auto_disable_unsupported_modifiers,
@@ -222,6 +237,7 @@ def apply_saved_settings(settings, payload):
         settings.corrective_iterations = payload.get("corrective_iterations", settings.corrective_iterations)
         settings.key_prefix = payload.get("key_prefix", settings.key_prefix)
         settings.replace_existing = payload.get("replace_existing", settings.replace_existing)
+        settings.replace_target_on_rebake = payload.get("replace_target_on_rebake", settings.replace_target_on_rebake)
         settings.disable_subsurf = payload.get("disable_subsurf", settings.disable_subsurf)
         settings.auto_apply_muscle = payload.get("auto_apply_muscle", settings.auto_apply_muscle)
         settings.auto_disable_unsupported_modifiers = payload.get("auto_disable_unsupported_modifiers", settings.auto_disable_unsupported_modifiers)
@@ -256,7 +272,20 @@ def load_settings_for_muscle(settings, muscle_obj):
         payload.setdefault("rig_object_name", inferred.get("rig_object_name", ""))
         payload.setdefault("bone_name", inferred.get("bone_name", ""))
     apply_saved_settings(settings, payload)
+    settings.rename_buffer = muscle_obj.name if muscle_obj is not None else ""
     save_selected_muscle_settings(settings)
+
+
+def find_preview_actions(settings, muscle_obj=None):
+    muscle_obj = muscle_obj or get_selected_scene_muscle(settings)
+    if muscle_obj is None:
+        return None, None, None, None
+    scene = bpy.context.scene
+    body_obj = infer_body_for_muscle(scene, muscle_obj)
+    links = infer_links_for_muscle(scene, muscle_obj)
+    rig_obj = bpy.data.objects.get(links["rig_object_name"]) if links.get("rig_object_name") else None
+    shape_action_name, rig_action_name = preview_action_names(settings.key_prefix, muscle_obj, body_obj, rig_obj)
+    return bpy.data.actions.get(shape_action_name), bpy.data.actions.get(rig_action_name), body_obj, rig_obj
 
 
 def ensure_object_mode(context):
@@ -451,6 +480,31 @@ def remove_existing_shape_keys(context, body_obj, prefix):
     for key in keys_to_remove:
         body_obj.active_shape_key_index = body_obj.data.shape_keys.key_blocks.find(key.name)
         bpy.ops.object.shape_key_remove(all=False)
+
+
+def remove_shape_keys_for_muscle(context, body_obj, prefix, muscle_name):
+    if not body_obj.data.shape_keys:
+        return
+
+    token_prefix = muscle_key_prefix(prefix, muscle_name)
+    key_blocks = list(body_obj.data.shape_keys.key_blocks)
+    keys_to_remove = [key for key in key_blocks if key.name != "Basis" and key.name.startswith(token_prefix)]
+    if not keys_to_remove:
+        return
+
+    ensure_object_mode(context)
+    make_object_active(context, body_obj)
+    for key in keys_to_remove:
+        body_obj.active_shape_key_index = body_obj.data.shape_keys.key_blocks.find(key.name)
+        bpy.ops.object.shape_key_remove(all=False)
+
+
+def remove_preview_actions(prefix, muscle_obj, body_obj, rig_obj):
+    shape_name, rig_name = preview_action_names(prefix, muscle_obj, body_obj, rig_obj)
+    for action_name in (shape_name, rig_name):
+        action = bpy.data.actions.get(action_name)
+        if action and action.users == 0:
+            bpy.data.actions.remove(action)
 
 
 def evaluate_body_vertices(context, body_obj):
@@ -919,8 +973,11 @@ def generate_preview_animation(settings, body_obj, rig_obj, pose_bone, sampled_r
     if shape_keys.animation_data is None:
         shape_keys.animation_data_create()
     mute_existing_nla_tracks(shape_keys.animation_data)
-    action_name = f"{settings.key_prefix}{sanitize_key_token(body_obj.name)}_ShapePreview"
-    shape_action = bpy.data.actions.new(name=action_name)
+    shape_action_name, rig_action_name = preview_action_names(settings.key_prefix, bpy.data.objects[settings.muscle_name], body_obj, rig_obj)
+    existing_shape_action = bpy.data.actions.get(shape_action_name)
+    if existing_shape_action and existing_shape_action.users == 0:
+        bpy.data.actions.remove(existing_shape_action)
+    shape_action = bpy.data.actions.new(name=shape_action_name)
     shape_keys.animation_data.action = shape_action
 
     relevant_keys = [shape_keys.key_blocks[name] for name in key_names if name in shape_keys.key_blocks]
@@ -934,7 +991,10 @@ def generate_preview_animation(settings, body_obj, rig_obj, pose_bone, sampled_r
     if rig_obj.animation_data is None:
         rig_obj.animation_data_create()
     mute_existing_nla_tracks(rig_obj.animation_data)
-    rig_action = bpy.data.actions.new(name=f"{settings.key_prefix}{sanitize_key_token(rig_obj.name)}_BonePreview")
+    existing_rig_action = bpy.data.actions.get(rig_action_name)
+    if existing_rig_action and existing_rig_action.users == 0:
+        bpy.data.actions.remove(existing_rig_action)
+    rig_action = bpy.data.actions.new(name=rig_action_name)
     rig_obj.animation_data.action = rig_action
 
     for frame, quat in zip(sample_frames, sampled_rots):
@@ -1018,6 +1078,12 @@ class XMRB_Settings(bpy.types.PropertyGroup):
     replace_existing: BoolProperty(
         name="Replace Existing",
         description="Remove previously generated shape keys that share the same prefix before baking new ones",
+        default=False,
+        update=settings_changed,
+    )
+    replace_target_on_rebake: BoolProperty(
+        name="Replace For Target Muscle On Rebake",
+        description="Before baking, remove only the previously generated shape keys and preview actions for the selected muscle",
         default=True,
         update=settings_changed,
     )
@@ -1111,6 +1177,16 @@ class XMRB_Settings(bpy.types.PropertyGroup):
         min=1,
         update=settings_changed,
     )
+    show_advanced_options: BoolProperty(
+        name="Enable Advanced Options",
+        description="Show destructive or lower-level bake options",
+        default=False,
+    )
+    rename_buffer: StringProperty(
+        name="Rename",
+        description="Temporary field used to rename the selected muscle and its related baked outputs",
+        default="",
+    )
 
 
 class XMRB_OT_guess_rig(bpy.types.Operator):
@@ -1149,6 +1225,121 @@ class XMRB_OT_select_muscle(bpy.types.Operator):
         load_settings_for_muscle(settings, muscle_obj)
 
         set_single_object_selection(context, muscle_obj)
+        return {"FINISHED"}
+
+
+class XMRB_OT_activate_preview_animation(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.activate_preview_animation"
+    bl_label = "Activate Preview Animation"
+    bl_description = "Make the generated preview actions for this muscle active on the rig and shape keys"
+
+    muscle_name: StringProperty()
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        muscle_obj = bpy.data.objects.get(self.muscle_name)
+        if muscle_obj is None:
+            self.report({"ERROR"}, "Muscle not found")
+            return {"CANCELLED"}
+
+        settings.sync_settings_lock = True
+        settings.muscle_name = muscle_obj.name
+        settings.sync_settings_lock = False
+        load_settings_for_muscle(settings, muscle_obj)
+
+        shape_action, rig_action, body_obj, rig_obj = find_preview_actions(settings, muscle_obj)
+        if shape_action is None and rig_action is None:
+            self.report({"WARNING"}, "No preview animation found for this muscle yet")
+            return {"CANCELLED"}
+
+        if body_obj and body_obj.data.shape_keys:
+            shape_keys = body_obj.data.shape_keys
+            if shape_keys.animation_data is None:
+                shape_keys.animation_data_create()
+            if shape_action is not None:
+                shape_keys.animation_data.action = shape_action
+
+        if rig_obj is not None:
+            if rig_obj.animation_data is None:
+                rig_obj.animation_data_create()
+            if rig_action is not None:
+                rig_obj.animation_data.action = rig_action
+
+        self.report({"INFO"}, "Preview animation activated")
+        return {"FINISHED"}
+
+
+class XMRB_OT_rename_muscle(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.rename_muscle"
+    bl_label = "Rename Muscle"
+    bl_description = "Rename this muscle through X-Muscle and rename previously baked keys and preview actions for it"
+
+    muscle_name: StringProperty()
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        muscle_obj = bpy.data.objects.get(self.muscle_name)
+        if muscle_obj is None:
+            self.report({"ERROR"}, "Muscle not found")
+            return {"CANCELLED"}
+
+        new_name = settings.rename_buffer.strip()
+        if not new_name:
+            self.report({"ERROR"}, "Enter a new muscle name first")
+            return {"CANCELLED"}
+        old_name = muscle_obj.name
+        if new_name == old_name:
+            return {"FINISHED"}
+
+        body_obj = infer_body_for_muscle(context.scene, muscle_obj)
+        rig_obj = bpy.data.objects.get(infer_links_for_muscle(context.scene, muscle_obj)["rig_object_name"]) if muscle_obj else None
+        old_shape_action_name, old_rig_action_name = preview_action_names(settings.key_prefix, muscle_obj, body_obj, rig_obj)
+        old_prefix = muscle_key_prefix(settings.key_prefix, old_name)
+        old_selection = snapshot_selection(context)
+        old_active = context.view_layer.objects.active
+
+        try:
+            set_single_object_selection(context, muscle_obj)
+            if hasattr(context.scene, "Muscle_Name") and hasattr(bpy.ops.muscle, "rename_muscle"):
+                context.scene.Muscle_Name = new_name
+                bpy.ops.muscle.rename_muscle()
+            else:
+                muscle_obj.name = new_name
+        finally:
+            restore_selection(context, old_active, old_selection[1])
+
+        renamed_muscle = bpy.data.objects.get(new_name)
+        if renamed_muscle is None:
+            renamed_muscle = muscle_obj if muscle_obj.name == new_name else None
+        if renamed_muscle is None:
+            self.report({"ERROR"}, "Rename failed")
+            return {"CANCELLED"}
+
+        new_body_obj = infer_body_for_muscle(context.scene, renamed_muscle) or body_obj
+        new_rig_name = infer_links_for_muscle(context.scene, renamed_muscle)["rig_object_name"]
+        new_rig_obj = bpy.data.objects.get(new_rig_name) if new_rig_name else rig_obj
+        new_prefix = muscle_key_prefix(settings.key_prefix, renamed_muscle.name)
+
+        if new_body_obj and new_body_obj.data.shape_keys:
+            for key_block in new_body_obj.data.shape_keys.key_blocks:
+                if key_block.name.startswith(old_prefix):
+                    key_block.name = new_prefix + key_block.name[len(old_prefix):]
+
+        new_shape_action_name, new_rig_action_name = preview_action_names(settings.key_prefix, renamed_muscle, new_body_obj, new_rig_obj)
+        shape_action = bpy.data.actions.get(old_shape_action_name)
+        if shape_action:
+            shape_action.name = new_shape_action_name
+        rig_action = bpy.data.actions.get(old_rig_action_name)
+        if rig_action:
+            rig_action.name = new_rig_action_name
+
+        settings.sync_settings_lock = True
+        settings.muscle_name = renamed_muscle.name
+        settings.sync_settings_lock = False
+        load_settings_for_muscle(settings, renamed_muscle)
+        settings.rename_buffer = renamed_muscle.name
+        save_selected_muscle_settings(settings)
+        self.report({"INFO"}, f"Renamed muscle to {renamed_muscle.name}")
         return {"FINISHED"}
 
 
@@ -1273,6 +1464,9 @@ class XMRB_OT_bake_range(bpy.types.Operator):
         ensure_body_shape_keys(context, body_obj)
         if settings.replace_existing:
             remove_existing_shape_keys(context, body_obj, settings.key_prefix)
+        elif settings.replace_target_on_rebake:
+            remove_shape_keys_for_muscle(context, body_obj, settings.key_prefix, muscle.name)
+            remove_preview_actions(settings.key_prefix, muscle, body_obj, rig_obj)
 
         muscles = iter_linked_muscles(body_obj)
         display_state = snapshot_muscle_display_state(muscles)
@@ -1375,6 +1569,8 @@ CORE_CLASSES = (
     XMRB_Settings,
     XMRB_OT_guess_rig,
     XMRB_OT_select_muscle,
+    XMRB_OT_activate_preview_animation,
+    XMRB_OT_rename_muscle,
     XMRB_OT_bake_specific_muscle,
     XMRB_OT_capture_pose,
     XMRB_OT_store_preview_base,

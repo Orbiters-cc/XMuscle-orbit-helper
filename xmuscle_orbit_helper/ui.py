@@ -24,14 +24,20 @@ class XMRB_PT_panel(bpy.types.Panel):
         for muscle_obj in muscles:
             row = col.row(align=True)
             is_selected = settings.muscle_name == muscle_obj.name
-            label = muscle_obj.name if not is_selected else f"{muscle_obj.name} *"
-            row.label(text=label, icon="FORCE_LENNARDJONES")
+            if is_selected:
+                row.prop(settings, "rename_buffer", text="", icon="FORCE_LENNARDJONES")
+                rename_op = row.operator("xmuscle_baker.rename_muscle", text="", icon="CHECKMARK")
+                rename_op.muscle_name = muscle_obj.name
+            else:
+                row.label(text=muscle_obj.name, icon="FORCE_LENNARDJONES")
             key_prefix = core.get_saved_prefix_for_muscle(muscle_obj, settings.key_prefix)
             bake_op = row.operator(
                 "xmuscle_baker.bake_specific_muscle",
                 text="Rebake" if core.muscle_has_baked_keys(context.scene, muscle_obj, key_prefix) else "Bake",
             )
             bake_op.muscle_name = muscle_obj.name
+            preview_op = row.operator("xmuscle_baker.activate_preview_animation", text="", icon="ACTION")
+            preview_op.muscle_name = muscle_obj.name
             select_op = row.operator("xmuscle_baker.select_muscle", text="Select")
             select_op.muscle_name = muscle_obj.name
 
@@ -92,17 +98,21 @@ class XMRB_PT_panel(bpy.types.Panel):
             col.label(text=estimate_secondary)
 
         col.separator()
-        col.label(text="Automatic Helpers")
-        col.prop(settings, "replace_existing")
-        col.prop(settings, "disable_subsurf")
-        col.prop(settings, "auto_disable_unsupported_modifiers")
-        col.prop(settings, "auto_apply_muscle")
-
-        col.separator()
         col.label(text="Preview Animation")
         col.prop(settings, "auto_generate_animation")
         col.prop(settings, "animation_start_frame")
         col.prop(settings, "animation_length")
+
+        col.separator()
+        col.prop(settings, "show_advanced_options")
+        if settings.show_advanced_options:
+            advanced = col.column(align=True)
+            advanced.label(text="Advanced Options")
+            advanced.prop(settings, "replace_existing")
+            advanced.prop(settings, "replace_target_on_rebake")
+            advanced.prop(settings, "disable_subsurf")
+            advanced.prop(settings, "auto_disable_unsupported_modifiers")
+            advanced.prop(settings, "auto_apply_muscle")
 
         col.separator()
         col.operator("xmuscle_baker.bake_range", icon="SHAPEKEY_DATA", text="Bake Selected Muscle")
