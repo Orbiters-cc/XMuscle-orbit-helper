@@ -34,6 +34,7 @@ CAPTURE_ITEMS = (
 
 
 MUSCLE_SETTINGS_PROP = "_xmoh_settings"
+SELECTION_SETTINGS_PROP = "_xmoh_selection_settings"
 
 
 def iter_linked_muscles(body_obj):
@@ -175,6 +176,41 @@ def get_selected_scene_muscle(settings):
     return bpy.data.objects.get(settings.muscle_name)
 
 
+def get_selected_muscle_names(settings):
+    if not settings:
+        return []
+    raw = getattr(settings, "selected_muscles_json", "")
+    if raw:
+        try:
+            names = json.loads(raw)
+            if isinstance(names, list):
+                return [name for name in names if isinstance(name, str) and bpy.data.objects.get(name)]
+        except json.JSONDecodeError:
+            pass
+    if settings.muscle_name and bpy.data.objects.get(settings.muscle_name):
+        return [settings.muscle_name]
+    return []
+
+
+def selection_key_for_names(muscle_names):
+    return "||".join(sorted(set(muscle_names)))
+
+
+def get_selection_settings_store(scene):
+    raw = scene.get(SELECTION_SETTINGS_PROP, "{}")
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return data
+
+
+def save_selection_settings_store(scene, data):
+    scene[SELECTION_SETTINGS_PROP] = json.dumps(data)
+
+
 def serialize_settings(settings):
     return {
         "body_object_name": settings.body_object.name if settings.body_object else "",
@@ -206,10 +242,18 @@ def serialize_settings(settings):
 
 
 def save_selected_muscle_settings(settings):
-    muscle_obj = get_selected_scene_muscle(settings)
-    if muscle_obj is None:
+    muscle_names = get_selected_muscle_names(settings)
+    if not muscle_names:
         return
-    muscle_obj[MUSCLE_SETTINGS_PROP] = json.dumps(serialize_settings(settings))
+    payload = json.dumps(serialize_settings(settings))
+    if len(muscle_names) == 1:
+        muscle_obj = bpy.data.objects.get(muscle_names[0])
+        if muscle_obj is not None:
+            muscle_obj[MUSCLE_SETTINGS_PROP] = payload
+    scene = bpy.context.scene
+    store = get_selection_settings_store(scene)
+    store[selection_key_for_names(muscle_names)] = json.loads(payload)
+    save_selection_settings_store(scene, store)
 
 
 def apply_saved_settings(settings, payload):
@@ -257,6 +301,52 @@ def apply_saved_settings(settings, payload):
         settings.sync_settings_lock = False
 
 
+def infer_links_for_group(scene, muscle_names):
+    muscles = [bpy.data.objects.get(name) for name in muscle_names]
+    muscles = [obj for obj in muscles if obj is not None]
+    if not muscles:
+        return {}
+
+    inferred = [infer_links_for_muscle(scene, muscle) for muscle in muscles]
+    body_names = {item.get("body_object_name", "") for item in inferred if item.get("body_object_name", "")}
+    rig_names = {item.get("rig_object_name", "") for item in inferred if item.get("rig_object_name", "")}
+    bone_names = {item.get("bone_name", "") for item in inferred if item.get("bone_name", "")}
+    return {
+        "body_object_name": next(iter(body_names)) if len(body_names) == 1 else "",
+        "rig_object_name": next(iter(rig_names)) if len(rig_names) == 1 else "",
+        "bone_name": next(iter(bone_names)) if len(bone_names) == 1 else "",
+    }
+
+
+def load_settings_for_selection(settings, muscle_names):
+    scene = bpy.context.scene
+    payload = {}
+    group_key = selection_key_for_names(muscle_names)
+    store = get_selection_settings_store(scene)
+    if group_key in store and isinstance(store[group_key], dict):
+        payload = store[group_key]
+    elif len(muscle_names) == 1:
+        muscle_obj = bpy.data.objects.get(muscle_names[0])
+        if muscle_obj is not None and muscle_obj.get(MUSCLE_SETTINGS_PROP):
+            try:
+                payload = json.loads(muscle_obj[MUSCLE_SETTINGS_PROP])
+            except json.JSONDecodeError:
+                payload = {}
+
+    inferred = infer_links_for_group(scene, muscle_names)
+    if not payload:
+        payload = inferred
+    else:
+        payload.setdefault("body_object_name", inferred.get("body_object_name", ""))
+        payload.setdefault("rig_object_name", inferred.get("rig_object_name", ""))
+        payload.setdefault("bone_name", inferred.get("bone_name", ""))
+
+    apply_saved_settings(settings, payload)
+    primary = bpy.data.objects.get(settings.muscle_name) or (bpy.data.objects.get(muscle_names[0]) if muscle_names else None)
+    settings.rename_buffer = primary.name if primary is not None else ""
+    save_selected_muscle_settings(settings)
+
+
 def load_settings_for_muscle(settings, muscle_obj):
     payload = {}
     if muscle_obj is not None and muscle_obj.get(MUSCLE_SETTINGS_PROP):
@@ -298,6 +388,26 @@ def settings_changed(self, _context):
     if getattr(self, "sync_settings_lock", False):
         return
     save_selected_muscle_settings(self)
+
+
+def set_selected_muscles(settings, muscle_names, active_name=None):
+    unique_names = []
+    for name in muscle_names:
+        if name and name not in unique_names and bpy.data.objects.get(name):
+            unique_names.append(name)
+
+    settings.sync_settings_lock = True
+    try:
+        settings.selected_muscles_json = json.dumps(unique_names)
+        if active_name in unique_names:
+            settings.muscle_name = active_name
+        elif unique_names:
+            settings.muscle_name = unique_names[0]
+        else:
+            settings.muscle_name = ""
+    finally:
+        settings.sync_settings_lock = False
+    load_settings_for_selection(settings, unique_names)
 
 
 def set_single_object_selection(context, obj):
@@ -444,14 +554,14 @@ def format_duration_brief(seconds):
     return f"{secs}s"
 
 
-def estimate_bake_seconds(body_obj, samples, corrective_iterations):
+def estimate_bake_seconds(body_obj, samples, corrective_iterations, muscle_count=1):
     if body_obj is None or body_obj.type != "MESH":
         return 0.0
     vertex_count = len(body_obj.data.vertices)
     polygon_count = len(body_obj.data.polygons)
     base = 2.0
     per_iteration = (vertex_count * 0.00002) + (polygon_count * 0.000025)
-    return base + (samples * corrective_iterations * per_iteration)
+    return base + (samples * corrective_iterations * max(1, muscle_count) * per_iteration)
 
 
 def describe_bake_estimate(settings):
@@ -460,9 +570,10 @@ def describe_bake_estimate(settings):
         return "Estimate unavailable", ""
     vertex_count = len(body_obj.data.vertices)
     polygon_count = len(body_obj.data.polygons)
-    estimate_seconds = estimate_bake_seconds(body_obj, settings.samples, settings.corrective_iterations)
+    muscle_count = max(1, len(get_selected_muscle_names(settings)))
+    estimate_seconds = estimate_bake_seconds(body_obj, settings.samples, settings.corrective_iterations, muscle_count)
     primary = f"Estimated bake: about {format_duration_brief(estimate_seconds)}"
-    secondary = f"{settings.samples} samples x {settings.corrective_iterations} iterations on {vertex_count:,} verts / {polygon_count:,} polys"
+    secondary = f"{muscle_count} muscle(s) x {settings.samples} samples x {settings.corrective_iterations} iterations on {vertex_count:,} verts / {polygon_count:,} polys"
     return primary, secondary
 
 
@@ -501,6 +612,12 @@ def remove_shape_keys_for_muscle(context, body_obj, prefix, muscle_name):
 
 def remove_preview_actions(prefix, muscle_obj, body_obj, rig_obj):
     shape_name, rig_name = preview_action_names(prefix, muscle_obj, body_obj, rig_obj)
+    if body_obj and body_obj.data.shape_keys and body_obj.data.shape_keys.animation_data:
+        if body_obj.data.shape_keys.animation_data.action and body_obj.data.shape_keys.animation_data.action.name == shape_name:
+            body_obj.data.shape_keys.animation_data.action = None
+    if rig_obj and rig_obj.animation_data:
+        if rig_obj.animation_data.action and rig_obj.animation_data.action.name == rig_name:
+            rig_obj.animation_data.action = None
     for action_name in (shape_name, rig_name):
         action = bpy.data.actions.get(action_name)
         if action and action.users == 0:
@@ -822,6 +939,16 @@ def restore_shape_key_values(body_obj, values):
             key_block.value = values[key_block.name]
 
 
+def zero_all_shape_keys(body_obj):
+    if body_obj.data.shape_keys is None:
+        return
+    for key_block in body_obj.data.shape_keys.key_blocks:
+        if key_block.name != "Basis":
+            key_block.value = 0.0
+    body_obj.active_shape_key_index = 0
+    body_obj.show_only_shape_key = False
+
+
 def update_mesh_state(ob):
     depsgraph = bpy.context.evaluated_depsgraph_get()
     depsgraph.update()
@@ -955,7 +1082,7 @@ def mute_existing_nla_tracks(animation_data):
         track.mute = True
 
 
-def generate_preview_animation(settings, body_obj, rig_obj, pose_bone, sampled_rots, key_names):
+def generate_preview_animation(settings, muscle_obj, body_obj, rig_obj, pose_bone, sampled_rots, key_names):
     scene = bpy.context.scene
     start_frame = settings.animation_start_frame
     end_frame = start_frame + max(1, settings.animation_length)
@@ -973,10 +1100,8 @@ def generate_preview_animation(settings, body_obj, rig_obj, pose_bone, sampled_r
     if shape_keys.animation_data is None:
         shape_keys.animation_data_create()
     mute_existing_nla_tracks(shape_keys.animation_data)
-    shape_action_name, rig_action_name = preview_action_names(settings.key_prefix, bpy.data.objects[settings.muscle_name], body_obj, rig_obj)
-    existing_shape_action = bpy.data.actions.get(shape_action_name)
-    if existing_shape_action and existing_shape_action.users == 0:
-        bpy.data.actions.remove(existing_shape_action)
+    remove_preview_actions(settings.key_prefix, muscle_obj, body_obj, rig_obj)
+    shape_action_name, rig_action_name = preview_action_names(settings.key_prefix, muscle_obj, body_obj, rig_obj)
     shape_action = bpy.data.actions.new(name=shape_action_name)
     shape_keys.animation_data.action = shape_action
 
@@ -991,9 +1116,6 @@ def generate_preview_animation(settings, body_obj, rig_obj, pose_bone, sampled_r
     if rig_obj.animation_data is None:
         rig_obj.animation_data_create()
     mute_existing_nla_tracks(rig_obj.animation_data)
-    existing_rig_action = bpy.data.actions.get(rig_action_name)
-    if existing_rig_action and existing_rig_action.users == 0:
-        bpy.data.actions.remove(existing_rig_action)
     rig_action = bpy.data.actions.new(name=rig_action_name)
     rig_obj.animation_data.action = rig_action
 
@@ -1013,6 +1135,7 @@ def generate_preview_animation(settings, body_obj, rig_obj, pose_bone, sampled_r
 
 class XMRB_Settings(bpy.types.PropertyGroup):
     sync_settings_lock: BoolProperty(default=False)
+    selected_muscles_json: StringProperty(default="[]")
     body_object: PointerProperty(
         name="Body",
         type=bpy.types.Object,
@@ -1219,12 +1342,33 @@ class XMRB_OT_select_muscle(bpy.types.Operator):
             self.report({"ERROR"}, "Muscle not found")
             return {"CANCELLED"}
 
-        settings.sync_settings_lock = True
-        settings.muscle_name = muscle_obj.name
-        settings.sync_settings_lock = False
-        load_settings_for_muscle(settings, muscle_obj)
-
+        set_selected_muscles(settings, [muscle_obj.name], active_name=muscle_obj.name)
         set_single_object_selection(context, muscle_obj)
+        return {"FINISHED"}
+
+
+class XMRB_OT_toggle_muscle_selection(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.toggle_muscle_selection"
+    bl_label = "Toggle Muscle Selection"
+    bl_description = "Add or remove this muscle from the current bake selection group"
+
+    muscle_name: StringProperty()
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        muscle_obj = bpy.data.objects.get(self.muscle_name)
+        if muscle_obj is None:
+            self.report({"ERROR"}, "Muscle not found")
+            return {"CANCELLED"}
+
+        selected = get_selected_muscle_names(settings)
+        if muscle_obj.name in selected:
+            selected = [name for name in selected if name != muscle_obj.name]
+            active_name = selected[0] if selected else ""
+        else:
+            selected.append(muscle_obj.name)
+            active_name = muscle_obj.name
+        set_selected_muscles(settings, selected, active_name=active_name)
         return {"FINISHED"}
 
 
@@ -1333,10 +1477,9 @@ class XMRB_OT_rename_muscle(bpy.types.Operator):
         if rig_action:
             rig_action.name = new_rig_action_name
 
-        settings.sync_settings_lock = True
-        settings.muscle_name = renamed_muscle.name
-        settings.sync_settings_lock = False
-        load_settings_for_muscle(settings, renamed_muscle)
+        selected_names = get_selected_muscle_names(settings)
+        selected_names = [renamed_muscle.name if name == old_name else name for name in selected_names]
+        set_selected_muscles(settings, selected_names, active_name=renamed_muscle.name)
         settings.rename_buffer = renamed_muscle.name
         save_selected_muscle_settings(settings)
         self.report({"INFO"}, f"Renamed muscle to {renamed_muscle.name}")
@@ -1414,6 +1557,7 @@ class XMRB_OT_bake_range(bpy.types.Operator):
         settings = context.scene.xmuscle_range_baker
         body_obj = settings.body_object
         rig_obj = settings.rig_object
+        selected_muscle_names = get_selected_muscle_names(settings)
 
         if body_obj is None:
             self.report({"ERROR"}, "Choose a body mesh")
@@ -1424,49 +1568,16 @@ class XMRB_OT_bake_range(bpy.types.Operator):
         if not settings.bone_name or settings.bone_name not in rig_obj.pose.bones:
             self.report({"ERROR"}, "Choose a valid pose bone on the selected armature")
             return {"CANCELLED"}
-        if not settings.muscle_name:
-            self.report({"ERROR"}, "Select a muscle from the scene list first")
+        if not selected_muscle_names:
+            self.report({"ERROR"}, "Select at least one muscle from the scene list first")
             return {"CANCELLED"}
 
         ensure_object_mode(context)
         previous_active, previous_selection = snapshot_selection(context)
 
-        muscle = find_muscle_by_name(body_obj, settings.muscle_name)
-        if muscle is None:
-            if not settings.auto_apply_muscle:
-                self.report({"ERROR"}, "The selected muscle is not linked to the body mesh")
-                return {"CANCELLED"}
-            if not hasattr(bpy.ops.muscle, "apply_musculature"):
-                self.report({"ERROR"}, "X-Muscle System is not available; cannot auto-apply muscles to the body")
-                return {"CANCELLED"}
-
-            scene_muscle = bpy.data.objects.get(settings.muscle_name)
-            if scene_muscle is None or not getattr(scene_muscle, "Muscle_XID", False):
-                self.report({"ERROR"}, "The selected X-Muscle could not be found in the scene")
-                return {"CANCELLED"}
-
-            for selected in list(context.selected_objects):
-                selected.select_set(False)
-            scene_muscle.select_set(True)
-            body_obj.select_set(True)
-            context.view_layer.objects.active = body_obj
-            try:
-                bpy.ops.muscle.apply_musculature()
-            except RuntimeError as exc:
-                self.report({"ERROR"}, f"Failed to auto-apply the muscle to the body: {exc}")
-                return {"CANCELLED"}
-            muscle = find_muscle_by_name(body_obj, settings.muscle_name)
-
-        if muscle is None:
-            self.report({"ERROR"}, "The body mesh still has no shrinkwrap link to that muscle")
-            return {"CANCELLED"}
-
         ensure_body_shape_keys(context, body_obj)
         if settings.replace_existing:
             remove_existing_shape_keys(context, body_obj, settings.key_prefix)
-        elif settings.replace_target_on_rebake:
-            remove_shape_keys_for_muscle(context, body_obj, settings.key_prefix, muscle.name)
-            remove_preview_actions(settings.key_prefix, muscle, body_obj, rig_obj)
 
         muscles = iter_linked_muscles(body_obj)
         display_state = snapshot_muscle_display_state(muscles)
@@ -1489,11 +1600,11 @@ class XMRB_OT_bake_range(bpy.types.Operator):
                 sampled_rots.append(Euler(tuple(euler_vector), "XYZ").to_quaternion())
 
         disabled_modifiers = []
-        created_key_names = []
-        estimated_seconds = estimate_bake_seconds(body_obj, len(sampled_rots), settings.corrective_iterations)
+        created_key_names_by_muscle = {}
+        estimated_seconds = estimate_bake_seconds(body_obj, len(sampled_rots), settings.corrective_iterations, len(selected_muscle_names))
         bake_started_at = time.perf_counter()
         window_manager = context.window_manager
-        total_progress_steps = max(1, len(sampled_rots) * max(1, settings.corrective_iterations))
+        total_progress_steps = max(1, len(sampled_rots) * max(1, settings.corrective_iterations) * max(1, len(selected_muscle_names)))
         if estimated_seconds > 0:
             self.report({"INFO"}, f"Estimated bake time: about {format_duration_brief(estimated_seconds)}")
 
@@ -1504,44 +1615,86 @@ class XMRB_OT_bake_range(bpy.types.Operator):
             window_manager.progress_begin(0, total_progress_steps)
 
             with preserved_pose_bone_rotation(pose_bone):
-                isolate_single_muscle(muscles, muscle)
-                context.view_layer.update()
+                for muscle_position, muscle_name in enumerate(selected_muscle_names, start=1):
+                    muscle = find_muscle_by_name(body_obj, muscle_name)
+                    if muscle is None:
+                        if not settings.auto_apply_muscle:
+                            self.report({"ERROR"}, f"{muscle_name} is not linked to the body mesh")
+                            return {"CANCELLED"}
+                        if not hasattr(bpy.ops.muscle, "apply_musculature"):
+                            self.report({"ERROR"}, "X-Muscle System is not available; cannot auto-apply muscles to the body")
+                            return {"CANCELLED"}
 
-                for index, quat in enumerate(sampled_rots, start=1):
-                    apply_quaternion_to_pose_bone(pose_bone, quat)
+                        scene_muscle = bpy.data.objects.get(muscle_name)
+                        if scene_muscle is None or not getattr(scene_muscle, "Muscle_XID", False):
+                            self.report({"ERROR"}, f"{muscle_name} could not be found in the scene")
+                            return {"CANCELLED"}
+
+                        for selected in list(context.selected_objects):
+                            selected.select_set(False)
+                        scene_muscle.select_set(True)
+                        body_obj.select_set(True)
+                        context.view_layer.objects.active = body_obj
+                        try:
+                            bpy.ops.muscle.apply_musculature()
+                        except RuntimeError as exc:
+                            self.report({"ERROR"}, f"Failed to auto-apply {muscle_name} to the body: {exc}")
+                            return {"CANCELLED"}
+                        muscles = iter_linked_muscles(body_obj)
+                        muscle = find_muscle_by_name(body_obj, muscle_name)
+
+                    if muscle is None:
+                        self.report({"ERROR"}, f"The body mesh still has no shrinkwrap link to {muscle_name}")
+                        return {"CANCELLED"}
+
+                    if settings.replace_target_on_rebake and not settings.replace_existing:
+                        remove_shape_keys_for_muscle(context, body_obj, settings.key_prefix, muscle.name)
+                        remove_preview_actions(settings.key_prefix, muscle, body_obj, rig_obj)
+
+                    isolate_single_muscle(muscles, muscle)
+                    zero_all_shape_keys(body_obj)
                     context.view_layer.update()
+                    created_key_names = []
 
-                    set_body_xmuscle_state(body_obj, enabled=True, solo_muscle=muscle)
-                    context.view_layer.update()
-                    source_obj = duplicate_flatten_modifiers(
-                        context,
-                        body_obj,
-                        f"{body_obj.name}_xmuscle_bake_{index:03d}",
-                    )
-
-                    try:
-                        set_body_xmuscle_state(body_obj, enabled=False)
+                    for index, quat in enumerate(sampled_rots, start=1):
+                        zero_all_shape_keys(body_obj)
+                        apply_quaternion_to_pose_bone(pose_bone, quat)
                         context.view_layer.update()
-                        body_obj.active_shape_key_index = 0
-                        generated_shape = add_corrective_pose_shape(
-                            source_obj,
-                            body_obj,
-                            iterations=settings.corrective_iterations,
-                            progress_callback=lambda iteration_done, iteration_total, sample_index=index: window_manager.progress_update(
-                                ((sample_index - 1) * iteration_total) + iteration_done
-                            ),
-                        )
-                        key_name = build_key_name(settings.key_prefix, muscle.name, index, len(sampled_rots))
-                        generated_shape.name = key_name
-                        generated_shape.slider_min = 0.0
-                        generated_shape.slider_max = 1.0
-                        generated_shape.value = 0.0
-                        created_key_names.append(key_name)
-                    finally:
-                        remove_temporary_object(source_obj)
 
-                if settings.auto_generate_animation and created_key_names:
-                    generate_preview_animation(settings, body_obj, rig_obj, pose_bone, sampled_rots, created_key_names)
+                        set_body_xmuscle_state(body_obj, enabled=True, solo_muscle=muscle)
+                        context.view_layer.update()
+                        source_obj = duplicate_flatten_modifiers(
+                            context,
+                            body_obj,
+                            f"{body_obj.name}_{sanitize_key_token(muscle.name)}_xmuscle_bake_{index:03d}",
+                        )
+
+                        try:
+                            zero_all_shape_keys(body_obj)
+                            set_body_xmuscle_state(body_obj, enabled=False)
+                            context.view_layer.update()
+                            body_obj.active_shape_key_index = 0
+                            generated_shape = add_corrective_pose_shape(
+                                source_obj,
+                                body_obj,
+                                iterations=settings.corrective_iterations,
+                                progress_callback=lambda iteration_done, iteration_total, sample_index=index, muscle_offset=muscle_position - 1: window_manager.progress_update(
+                                    (muscle_offset * len(sampled_rots) * iteration_total) + ((sample_index - 1) * iteration_total) + iteration_done
+                                ),
+                            )
+                            key_name = build_key_name(settings.key_prefix, muscle.name, index, len(sampled_rots))
+                            generated_shape.name = key_name
+                            generated_shape.slider_min = 0.0
+                            generated_shape.slider_max = 1.0
+                            generated_shape.value = 0.0
+                            created_key_names.append(key_name)
+                        finally:
+                            remove_temporary_object(source_obj)
+                            zero_all_shape_keys(body_obj)
+
+                    created_key_names_by_muscle[muscle.name] = created_key_names
+                    if settings.auto_generate_animation and created_key_names:
+                        generate_preview_animation(settings, muscle, body_obj, rig_obj, pose_bone, sampled_rots, created_key_names)
 
         finally:
             window_manager.progress_end()
@@ -1555,7 +1708,8 @@ class XMRB_OT_bake_range(bpy.types.Operator):
             context.view_layer.update()
 
         elapsed_seconds = time.perf_counter() - bake_started_at
-        message = f"Created {len(created_key_names)} shape keys on {body_obj.name} in {format_duration_brief(elapsed_seconds)}"
+        total_created = sum(len(names) for names in created_key_names_by_muscle.values())
+        message = f"Created {total_created} shape keys across {len(created_key_names_by_muscle)} muscle(s) on {body_obj.name} in {format_duration_brief(elapsed_seconds)}"
         if estimated_seconds > 0:
             message += f" (estimate was {format_duration_brief(estimated_seconds)})"
         if disabled_modifiers:
@@ -1569,6 +1723,7 @@ CORE_CLASSES = (
     XMRB_Settings,
     XMRB_OT_guess_rig,
     XMRB_OT_select_muscle,
+    XMRB_OT_toggle_muscle_selection,
     XMRB_OT_activate_preview_animation,
     XMRB_OT_rename_muscle,
     XMRB_OT_bake_specific_muscle,

@@ -14,6 +14,7 @@ class XMRB_PT_panel(bpy.types.Panel):
         layout = self.layout
         settings = context.scene.xmuscle_range_baker
         muscles = core.iter_scene_muscles(context.scene)
+        selected_names = set(core.get_selected_muscle_names(settings))
 
         col = layout.column(align=True)
         col.label(text="Scene Muscles")
@@ -22,33 +23,42 @@ class XMRB_PT_panel(bpy.types.Panel):
             return
 
         for muscle_obj in muscles:
-            row = col.row(align=True)
+            box = col.box()
+            header = box.row(align=True)
             is_selected = settings.muscle_name == muscle_obj.name
+            in_group = muscle_obj.name in selected_names
+            toggle = header.operator(
+                "xmuscle_baker.toggle_muscle_selection",
+                text="",
+                icon="CHECKBOX_HLT" if in_group else "CHECKBOX_DEHLT",
+            )
+            toggle.muscle_name = muscle_obj.name
             if is_selected:
-                row.prop(settings, "rename_buffer", text="", icon="FORCE_LENNARDJONES")
-                rename_op = row.operator("xmuscle_baker.rename_muscle", text="", icon="CHECKMARK")
+                header.prop(settings, "rename_buffer", text="", icon="FORCE_LENNARDJONES")
+                rename_op = header.operator("xmuscle_baker.rename_muscle", text="", icon="CHECKMARK")
                 rename_op.muscle_name = muscle_obj.name
             else:
-                row.label(text=muscle_obj.name, icon="FORCE_LENNARDJONES")
+                header.label(text=muscle_obj.name, icon="FORCE_LENNARDJONES")
+
+            actions = box.row(align=True)
             key_prefix = core.get_saved_prefix_for_muscle(muscle_obj, settings.key_prefix)
-            bake_op = row.operator(
+            bake_op = actions.operator(
                 "xmuscle_baker.bake_specific_muscle",
                 text="Rebake" if core.muscle_has_baked_keys(context.scene, muscle_obj, key_prefix) else "Bake",
             )
             bake_op.muscle_name = muscle_obj.name
-            preview_op = row.operator("xmuscle_baker.activate_preview_animation", text="", icon="ACTION")
+            preview_op = actions.operator("xmuscle_baker.activate_preview_animation", text="", icon="ACTION")
             preview_op.muscle_name = muscle_obj.name
-            select_op = row.operator("xmuscle_baker.select_muscle", text="Select")
+            select_op = actions.operator("xmuscle_baker.select_muscle", text="Only")
             select_op.muscle_name = muscle_obj.name
 
         col.separator()
-        col.label(text="Selected Muscle Settings")
-        if settings.muscle_name:
-            selected_muscle = bpy.data.objects.get(settings.muscle_name)
-            if selected_muscle is not None:
-                col.label(text=selected_muscle.name, icon="FORCE_LENNARDJONES")
+        col.label(text="Selected Muscle Group Settings")
+        if selected_names:
+            selected_label = ", ".join(core.get_selected_muscle_names(settings))
+            col.label(text=selected_label)
         else:
-            col.label(text="Select a muscle above to edit its saved bake settings")
+            col.label(text="Select one or more muscles above to edit their shared saved settings")
 
         col.prop(settings, "body_object")
 
@@ -115,7 +125,7 @@ class XMRB_PT_panel(bpy.types.Panel):
             advanced.prop(settings, "auto_apply_muscle")
 
         col.separator()
-        col.operator("xmuscle_baker.bake_range", icon="SHAPEKEY_DATA", text="Bake Selected Muscle")
+        col.operator("xmuscle_baker.bake_range", icon="SHAPEKEY_DATA", text="Bake Selected Muscle Group")
 
 
 UI_CLASSES = (
