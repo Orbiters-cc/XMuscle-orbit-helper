@@ -489,6 +489,36 @@ def prepare_autoaim_pose_selection(context, rig_obj, selected_names, active_name
     return True, ordered
 
 
+def get_muscle_collection(muscle_obj):
+    if muscle_obj is None:
+        return None
+    for collection in muscle_obj.users_collection:
+        if collection.name == muscle_obj.name:
+            return collection
+    return muscle_obj.users_collection[0] if muscle_obj.users_collection else None
+
+
+def iter_muscle_elements(muscle_obj):
+    collection = get_muscle_collection(muscle_obj)
+    if collection is None:
+        return [muscle_obj]
+    return list(collection.objects)
+
+
+def set_muscle_visibility_mode(muscle_obj, mode):
+    elements = iter_muscle_elements(muscle_obj)
+    show_through = mode == "SHOW_THROUGH"
+    hidden = mode == "HIDE"
+    for obj in elements:
+        obj.hide_viewport = hidden
+        if hasattr(obj, "show_in_front"):
+            obj.show_in_front = show_through and not hidden
+    if hasattr(muscle_obj, "Muscle_View3D"):
+        muscle_obj.Muscle_View3D = not hidden
+    if hasattr(muscle_obj, "Micro_Controller_View3D"):
+        muscle_obj.Micro_Controller_View3D = (not hidden) and show_through and getattr(muscle_obj, "Micro_Controller", False)
+
+
 def make_object_active(context, obj):
     set_single_object_selection(context, obj)
 
@@ -1395,23 +1425,41 @@ class XMRB_OT_guess_rig(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class XMRB_OT_add_to_selected_bones(bpy.types.Operator):
-    bl_idname = "xmuscle_baker.add_to_selected_bones"
-    bl_label = "Add To Selected Bones"
-    bl_description = "Create a basic X-Muscle using Auto Aim, while automatically preparing the required mode, selection order, and scene options"
+class XMRB_OT_add_muscle(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.add_muscle"
+    bl_label = "Add Muscle"
+    bl_description = "Create an X-Muscle. When two target bones are selected, it automatically uses Auto Aim with the required setup"
     bl_options = {"REGISTER", "UNDO"}
+
+    muscle_type: EnumProperty(
+        items=(
+            ("BASIC", "Normal", ""),
+            ("STYLIZED", "Curved", ""),
+            ("STRIP", "Flat", ""),
+        )
+    )
 
     def execute(self, context):
         rig_obj = find_armature_for_autoaim(context)
-        if rig_obj is None:
-            self.report({"ERROR"}, "Select an armature with two target bones")
-            return {"CANCELLED"}
+        selected_names = []
+        active_name = ""
+        use_autoaim = False
+        operator_map = {
+            "BASIC": bpy.ops.muscle.add_basic_muscle,
+            "STYLIZED": bpy.ops.muscle.add_muscle,
+            "STRIP": bpy.ops.muscle.add_strip_muscle,
+        }
 
-        selected_names, active_name = get_selected_bone_names_for_autoaim(context, rig_obj)
-        ok, result = prepare_autoaim_pose_selection(context, rig_obj, selected_names, active_name)
-        if not ok:
-            self.report({"ERROR"}, result)
-            return {"CANCELLED"}
+        if rig_obj is not None:
+            selected_names, active_name = get_selected_bone_names_for_autoaim(context, rig_obj)
+            use_autoaim = len(selected_names) == 2 and bool(active_name)
+            if use_autoaim:
+                ok, result = prepare_autoaim_pose_selection(context, rig_obj, selected_names, active_name)
+                if not ok:
+                    self.report({"ERROR"}, result)
+                    return {"CANCELLED"}
+        else:
+            ensure_object_mode(context)
 
         scene = context.scene
         previous_create_type = getattr(scene, "Create_Type", "MANUAL")
@@ -1420,12 +1468,12 @@ class XMRB_OT_add_to_selected_bones(bpy.types.Operator):
         before_names = {obj.name for obj in iter_scene_muscles(scene)}
 
         try:
-            scene.Create_Type = "AUTOAIM"
+            scene.Create_Type = "AUTOAIM" if use_autoaim else "MANUAL"
             if not getattr(scene, "Muscle_Name", "").strip():
                 scene.Muscle_Name = "Muscle"
-            bpy.ops.muscle.add_basic_muscle()
+            operator_map[self.muscle_type]()
         except RuntimeError as exc:
-            self.report({"ERROR"}, f"X-Muscle Auto Aim failed: {exc}")
+            self.report({"ERROR"}, f"X-Muscle creation failed: {exc}")
             return {"CANCELLED"}
         finally:
             scene.Create_Type = previous_create_type
@@ -1437,11 +1485,12 @@ class XMRB_OT_add_to_selected_bones(bpy.types.Operator):
             settings = context.scene.xmuscle_range_baker
             set_selected_muscles(settings, [created_muscle.name], active_name=created_muscle.name)
             set_single_object_selection(context, created_muscle)
-            self.report({"INFO"}, f"Created {created_muscle.name} from selected bones")
+            creation_mode = "Auto Aim" if use_autoaim else "normal"
+            self.report({"INFO"}, f"Created {created_muscle.name} ({creation_mode})")
         else:
             restore_selection(context, previous_active, previous_selection)
             scene.Muscle_Name = previous_name
-            self.report({"WARNING"}, "No new muscle was detected after Auto Aim")
+            self.report({"WARNING"}, "No new muscle was detected after creation")
         return {"FINISHED"}
 
 
@@ -1486,6 +1535,52 @@ class XMRB_OT_toggle_muscle_selection(bpy.types.Operator):
             selected.append(muscle_obj.name)
             active_name = muscle_obj.name
         set_selected_muscles(settings, selected, active_name=active_name)
+        return {"FINISHED"}
+
+
+class XMRB_OT_select_muscle_elements(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.select_muscle_elements"
+    bl_label = "Select Muscle Elements"
+    bl_description = "Select all objects that belong to this muscle system so they can be moved together"
+
+    muscle_name: StringProperty()
+
+    def execute(self, context):
+        muscle_obj = bpy.data.objects.get(self.muscle_name)
+        if muscle_obj is None:
+            self.report({"ERROR"}, "Muscle not found")
+            return {"CANCELLED"}
+
+        for selected in list(context.selected_objects):
+            selected.select_set(False)
+        for obj in iter_muscle_elements(muscle_obj):
+            obj.hide_viewport = False
+            obj.select_set(True)
+        context.view_layer.objects.active = muscle_obj
+        self.report({"INFO"}, "Selected all muscle elements")
+        return {"FINISHED"}
+
+
+class XMRB_OT_set_muscle_visibility(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.set_muscle_visibility"
+    bl_label = "Set Muscle Visibility"
+    bl_description = "Set the selected muscle visibility mode"
+
+    mode: EnumProperty(
+        items=(
+            ("HIDE", "Hide", ""),
+            ("SHOW", "Show", ""),
+            ("SHOW_THROUGH", "Show Through", ""),
+        )
+    )
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        muscle_obj = get_selected_scene_muscle(settings)
+        if muscle_obj is None:
+            self.report({"ERROR"}, "Select a muscle first")
+            return {"CANCELLED"}
+        set_muscle_visibility_mode(muscle_obj, self.mode)
         return {"FINISHED"}
 
 
@@ -1839,9 +1934,11 @@ class XMRB_OT_bake_range(bpy.types.Operator):
 CORE_CLASSES = (
     XMRB_Settings,
     XMRB_OT_guess_rig,
-    XMRB_OT_add_to_selected_bones,
+    XMRB_OT_add_muscle,
     XMRB_OT_select_muscle,
     XMRB_OT_toggle_muscle_selection,
+    XMRB_OT_select_muscle_elements,
+    XMRB_OT_set_muscle_visibility,
     XMRB_OT_activate_preview_animation,
     XMRB_OT_rename_muscle,
     XMRB_OT_bake_specific_muscle,

@@ -13,11 +13,21 @@ class XMRB_PT_panel(bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.scene.xmuscle_range_baker
+        scene = context.scene
         muscles = core.iter_scene_muscles(context.scene)
         selected_names = set(core.get_selected_muscle_names(settings))
 
         col = layout.column(align=True)
-        col.operator("xmuscle_baker.add_to_selected_bones", icon="BONE_DATA", text="Add To Selected Bones")
+        col.label(text="Add Muscle")
+        if hasattr(scene, "Muscle_Name"):
+            col.prop(scene, "Muscle_Name", text="Name")
+        add_row = col.row(align=True)
+        add_op = add_row.operator("xmuscle_baker.add_muscle", text="Normal", icon="MESH_UVSPHERE")
+        add_op.muscle_type = "BASIC"
+        add_op = add_row.operator("xmuscle_baker.add_muscle", text="Curved", icon="MOD_CURVE")
+        add_op.muscle_type = "STYLIZED"
+        add_op = add_row.operator("xmuscle_baker.add_muscle", text="Flat", icon="MESH_PLANE")
+        add_op.muscle_type = "STRIP"
         col.separator()
         col.label(text="Scene Muscles")
         if not muscles:
@@ -51,6 +61,8 @@ class XMRB_PT_panel(bpy.types.Panel):
             bake_op.muscle_name = muscle_obj.name
             preview_op = actions.operator("xmuscle_baker.activate_preview_animation", text="", icon="ACTION")
             preview_op.muscle_name = muscle_obj.name
+            all_op = actions.operator("xmuscle_baker.select_muscle_elements", text="", icon="RESTRICT_SELECT_OFF")
+            all_op.muscle_name = muscle_obj.name
             select_op = actions.operator("xmuscle_baker.select_muscle", text="Only")
             select_op.muscle_name = muscle_obj.name
 
@@ -78,9 +90,14 @@ class XMRB_PT_panel(bpy.types.Panel):
         col.prop(settings, "use_captured_pose")
 
         row = col.row(align=True)
-        row.operator("xmuscle_baker.capture_pose", text="Capture Start", icon="IMPORT").target = "START"
-        row.operator("xmuscle_baker.capture_pose", text="Capture End", icon="EXPORT").target = "END"
-        col.operator("xmuscle_baker.store_preview_base", text="Store Current As Restore Pose", icon="ARMATURE_DATA")
+        row.operator("xmuscle_baker.store_preview_base", text="Store Current As Restore Pose", icon="ARMATURE_DATA")
+        col.separator()
+        start_row = col.row(align=True)
+        start_row.operator("xmuscle_baker.capture_pose", text="Start", icon="IMPORT").target = "START"
+        start_row.prop(settings, "start_rotation", text="")
+        end_row = col.row(align=True)
+        end_row.operator("xmuscle_baker.capture_pose", text="End", icon="EXPORT").target = "END"
+        end_row.prop(settings, "end_rotation", text="")
 
         pose_info = col.column(align=True)
         pose_info.enabled = False
@@ -88,16 +105,18 @@ class XMRB_PT_panel(bpy.types.Panel):
         pose_info.prop(settings, "has_end_pose", text="End Pose Captured")
 
         col.separator()
-        col.label(text="Manual Start Rotation")
-        col.prop(settings, "start_rotation", text="")
-        col.label(text="Manual End Rotation")
-        col.prop(settings, "end_rotation", text="")
-
-        col.separator()
         col.label(text="Preview")
         col.prop(settings, "preview_enabled")
         col.prop(settings, "preview_factor", slider=True)
         col.prop(settings, "mute_live_xmuscle")
+        visibility = col.row(align=True)
+        visibility.label(text="Visibility")
+        vis_op = visibility.operator("xmuscle_baker.set_muscle_visibility", text="Hide")
+        vis_op.mode = "HIDE"
+        vis_op = visibility.operator("xmuscle_baker.set_muscle_visibility", text="Show")
+        vis_op.mode = "SHOW"
+        vis_op = visibility.operator("xmuscle_baker.set_muscle_visibility", text="Show Through")
+        vis_op.mode = "SHOW_THROUGH"
 
         col.separator()
         col.label(text="Bake Output")
