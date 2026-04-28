@@ -108,6 +108,38 @@ def infer_body_for_muscle(scene, muscle_obj):
     return None
 
 
+def get_default_body_object(scene):
+    if scene is None:
+        return None
+    body_obj = scene.objects.get("Body")
+    if body_obj and body_obj.type == "MESH" and not getattr(body_obj, "Muscle_XID", False):
+        return body_obj
+    return None
+
+
+def get_effective_body_object(settings, scene=None):
+    if settings is None:
+        return None
+    body_obj = getattr(settings, "body_object", None)
+    if body_obj and body_obj.type == "MESH" and not getattr(body_obj, "Muscle_XID", False):
+        return body_obj
+    scene = scene or bpy.context.scene
+    return get_default_body_object(scene)
+
+
+def ensure_default_body_object(settings, scene=None):
+    if settings is None:
+        return None
+    body_obj = getattr(settings, "body_object", None)
+    if body_obj and body_obj.type == "MESH" and not getattr(body_obj, "Muscle_XID", False):
+        return body_obj
+    scene = scene or bpy.context.scene
+    default_body = get_default_body_object(scene)
+    if default_body is not None:
+        settings.body_object = default_body
+    return default_body
+
+
 def infer_links_for_muscle(scene, muscle_obj):
     body_obj = infer_body_for_muscle(scene, muscle_obj)
     controller = get_muscle_controller(muscle_obj)
@@ -297,6 +329,8 @@ def apply_saved_settings(settings, payload):
         settings.mute_live_xmuscle = payload.get("mute_live_xmuscle", False)
         settings.animation_start_frame = payload.get("animation_start_frame", settings.animation_start_frame)
         settings.animation_length = payload.get("animation_length", settings.animation_length)
+        if settings.body_object is None:
+            ensure_default_body_object(settings, bpy.context.scene)
     finally:
         settings.sync_settings_lock = False
 
@@ -382,6 +416,33 @@ def ensure_object_mode(context):
     active = context.view_layer.objects.active
     if active and active.mode != "OBJECT":
         bpy.ops.object.mode_set(mode="OBJECT")
+
+
+def apply_muscle_to_body(context, muscle_obj, body_obj):
+    if muscle_obj is None or not getattr(muscle_obj, "Muscle_XID", False):
+        return False, "Muscle not found"
+    if body_obj is None or body_obj.type != "MESH":
+        return False, "Choose a valid target mesh first"
+    if infer_body_for_muscle(context.scene, muscle_obj) == body_obj:
+        return True, f"{muscle_obj.name} is already applied to {body_obj.name}"
+    if not hasattr(bpy.ops.muscle, "apply_musculature"):
+        return False, "X-MUSCLE apply operator is not available"
+
+    ensure_object_mode(context)
+    previous_active, previous_selection = snapshot_selection(context)
+    try:
+        set_single_object_selection(context, muscle_obj)
+        body_obj.select_set(True)
+        context.view_layer.objects.active = body_obj
+        bpy.ops.muscle.apply_musculature()
+    except RuntimeError as exc:
+        return False, f"Failed to apply {muscle_obj.name} to {body_obj.name}: {exc}"
+    finally:
+        restore_selection(context, previous_active, previous_selection)
+
+    if infer_body_for_muscle(context.scene, muscle_obj) != body_obj:
+        return False, f"{muscle_obj.name} was created but is still not linked to {body_obj.name}"
+    return True, f"Applied {muscle_obj.name} to {body_obj.name}"
 
 
 def settings_changed(self, _context):
@@ -517,6 +578,11 @@ def set_muscle_visibility_mode(muscle_obj, mode):
         muscle_obj.Muscle_View3D = not hidden
     if hasattr(muscle_obj, "Micro_Controller_View3D"):
         muscle_obj.Micro_Controller_View3D = (not hidden) and show_through and getattr(muscle_obj, "Micro_Controller", False)
+
+
+def set_all_muscles_visibility_mode(scene, mode):
+    for muscle_obj in iter_scene_muscles(scene):
+        set_muscle_visibility_mode(muscle_obj, mode)
 
 
 def make_object_active(context, obj):
@@ -1483,10 +1549,19 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
         if created:
             created_muscle = created[-1]
             settings = context.scene.xmuscle_range_baker
+            ensure_default_body_object(settings, scene)
             set_selected_muscles(settings, [created_muscle.name], active_name=created_muscle.name)
             set_single_object_selection(context, created_muscle)
             creation_mode = "Auto Aim" if use_autoaim else "normal"
-            self.report({"INFO"}, f"Created {created_muscle.name} ({creation_mode})")
+            target_body = settings.body_object
+            if target_body is not None:
+                ok, message = apply_muscle_to_body(context, created_muscle, target_body)
+                if not ok:
+                    self.report({"WARNING"}, f"Created {created_muscle.name} ({creation_mode}), but {message}")
+                    return {"FINISHED"}
+                self.report({"INFO"}, f"Created {created_muscle.name} ({creation_mode}) and applied it to {target_body.name}")
+            else:
+                self.report({"WARNING"}, f"Created {created_muscle.name} ({creation_mode}), but no target Body mesh is set")
         else:
             restore_selection(context, previous_active, previous_selection)
             scene.Muscle_Name = previous_name
@@ -1561,10 +1636,37 @@ class XMRB_OT_select_muscle_elements(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class XMRB_OT_apply_muscle(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.apply_muscle"
+    bl_label = "Apply Muscle"
+    bl_description = "Apply this muscle to the currently chosen target body mesh"
+
+    muscle_name: StringProperty()
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        body_obj = ensure_default_body_object(settings, context.scene)
+        muscle_obj = bpy.data.objects.get(self.muscle_name)
+        if muscle_obj is None:
+            self.report({"ERROR"}, "Muscle not found")
+            return {"CANCELLED"}
+        if body_obj is None:
+            self.report({"ERROR"}, "Choose a target body mesh in the Add Muscle section first")
+            return {"CANCELLED"}
+        ok, message = apply_muscle_to_body(context, muscle_obj, body_obj)
+        if not ok:
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+        if settings.muscle_name == muscle_obj.name:
+            save_selected_muscle_settings(settings)
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
 class XMRB_OT_set_muscle_visibility(bpy.types.Operator):
     bl_idname = "xmuscle_baker.set_muscle_visibility"
     bl_label = "Set Muscle Visibility"
-    bl_description = "Set the selected muscle visibility mode"
+    bl_description = "Set the visibility mode for all muscles in the scene"
 
     mode: EnumProperty(
         items=(
@@ -1575,12 +1677,10 @@ class XMRB_OT_set_muscle_visibility(bpy.types.Operator):
     )
 
     def execute(self, context):
-        settings = context.scene.xmuscle_range_baker
-        muscle_obj = get_selected_scene_muscle(settings)
-        if muscle_obj is None:
-            self.report({"ERROR"}, "Select a muscle first")
+        if not iter_scene_muscles(context.scene):
+            self.report({"ERROR"}, "No muscles found in the scene")
             return {"CANCELLED"}
-        set_muscle_visibility_mode(muscle_obj, self.mode)
+        set_all_muscles_visibility_mode(context.scene, self.mode)
         return {"FINISHED"}
 
 
@@ -1841,16 +1941,9 @@ class XMRB_OT_bake_range(bpy.types.Operator):
                         if scene_muscle is None or not getattr(scene_muscle, "Muscle_XID", False):
                             self.report({"ERROR"}, f"{muscle_name} could not be found in the scene")
                             return {"CANCELLED"}
-
-                        for selected in list(context.selected_objects):
-                            selected.select_set(False)
-                        scene_muscle.select_set(True)
-                        body_obj.select_set(True)
-                        context.view_layer.objects.active = body_obj
-                        try:
-                            bpy.ops.muscle.apply_musculature()
-                        except RuntimeError as exc:
-                            self.report({"ERROR"}, f"Failed to auto-apply {muscle_name} to the body: {exc}")
+                        ok, message = apply_muscle_to_body(context, scene_muscle, body_obj)
+                        if not ok:
+                            self.report({"ERROR"}, message)
                             return {"CANCELLED"}
                         muscles = iter_linked_muscles(body_obj)
                         muscle = find_muscle_by_name(body_obj, muscle_name)
@@ -1938,6 +2031,7 @@ CORE_CLASSES = (
     XMRB_OT_select_muscle,
     XMRB_OT_toggle_muscle_selection,
     XMRB_OT_select_muscle_elements,
+    XMRB_OT_apply_muscle,
     XMRB_OT_set_muscle_visibility,
     XMRB_OT_activate_preview_animation,
     XMRB_OT_rename_muscle,

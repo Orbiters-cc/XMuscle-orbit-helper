@@ -16,11 +16,15 @@ class XMRB_PT_panel(bpy.types.Panel):
         scene = context.scene
         muscles = core.iter_scene_muscles(context.scene)
         selected_names = set(core.get_selected_muscle_names(settings))
+        effective_body = core.get_effective_body_object(settings, scene)
 
         col = layout.column(align=True)
         col.label(text="Add Muscle")
         if hasattr(scene, "Muscle_Name"):
             col.prop(scene, "Muscle_Name", text="Name")
+        col.prop(settings, "body_object", text="Apply To")
+        if settings.body_object is None and effective_body is not None:
+            col.label(text=f"Default: {effective_body.name}", icon="INFO")
         add_row = col.row(align=True)
         add_op = add_row.operator("xmuscle_baker.add_muscle", text="Normal", icon="MESH_UVSPHERE")
         add_op.muscle_type = "BASIC"
@@ -65,6 +69,10 @@ class XMRB_PT_panel(bpy.types.Panel):
             all_op.muscle_name = muscle_obj.name
             select_op = actions.operator("xmuscle_baker.select_muscle", text="Only")
             select_op.muscle_name = muscle_obj.name
+            if core.infer_body_for_muscle(context.scene, muscle_obj) is None:
+                apply_row = box.row(align=True)
+                apply_op = apply_row.operator("xmuscle_baker.apply_muscle", text="Apply", icon="MOD_SHRINKWRAP")
+                apply_op.muscle_name = muscle_obj.name
 
         col.separator()
         col.label(text="Selected Muscle Group Settings")
