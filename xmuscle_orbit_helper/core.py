@@ -422,6 +422,73 @@ def set_single_object_selection(context, obj):
     view_layer.objects.active = obj
 
 
+def find_armature_for_autoaim(context):
+    obj = context.object
+    if obj and obj.type == "ARMATURE":
+        return obj
+    active = context.view_layer.objects.active
+    if active and active.type == "ARMATURE":
+        return active
+    selected_armatures = [obj for obj in context.selected_objects if obj.type == "ARMATURE"]
+    if len(selected_armatures) == 1:
+        return selected_armatures[0]
+    return None
+
+
+def get_selected_bone_names_for_autoaim(context, rig_obj):
+    active_name = ""
+    selected_names = []
+
+    if context.mode == "POSE" and context.pose_object == rig_obj:
+        if context.active_pose_bone:
+            active_name = context.active_pose_bone.name
+        selected_names = [bone.name for bone in context.selected_pose_bones or []]
+    elif context.mode == "EDIT_ARMATURE" and context.object == rig_obj:
+        active_bone = context.active_bone
+        if active_bone:
+            active_name = active_bone.name
+        selected_names = [bone.name for bone in context.selected_bones or []]
+    else:
+        active_bone = rig_obj.data.bones.active
+        if active_bone:
+            active_name = active_bone.name
+        selected_names = [bone.name for bone in rig_obj.data.bones if bone.select]
+
+    selected_names = [name for name in selected_names if name in rig_obj.pose.bones]
+    if active_name and active_name not in selected_names and active_name in rig_obj.pose.bones:
+        selected_names.append(active_name)
+    return selected_names, active_name
+
+
+def prepare_autoaim_pose_selection(context, rig_obj, selected_names, active_name):
+    if len(selected_names) < 2 or not active_name:
+        return False, "Select exactly two connected bones and make one of them active"
+    if active_name not in selected_names:
+        return False, "The active bone must be part of the selection"
+
+    ordered = [name for name in selected_names if name != active_name]
+    ordered.append(active_name)
+    if len(ordered) != 2:
+        return False, "Select exactly two bones for Add To Selected Bones"
+
+    ensure_object_mode(context)
+    set_single_object_selection(context, rig_obj)
+    bpy.ops.object.mode_set(mode="POSE")
+
+    for pose_bone in rig_obj.pose.bones:
+        pose_bone.select = False
+        if "selection_order" in pose_bone:
+            del pose_bone["selection_order"]
+
+    for index, bone_name in enumerate(ordered):
+        pose_bone = rig_obj.pose.bones[bone_name]
+        pose_bone.select = True
+        pose_bone["selection_order"] = index
+
+    rig_obj.data.bones.active = rig_obj.data.bones[active_name]
+    return True, ordered
+
+
 def make_object_active(context, obj):
     set_single_object_selection(context, obj)
 
@@ -1328,6 +1395,56 @@ class XMRB_OT_guess_rig(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class XMRB_OT_add_to_selected_bones(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.add_to_selected_bones"
+    bl_label = "Add To Selected Bones"
+    bl_description = "Create a basic X-Muscle using Auto Aim, while automatically preparing the required mode, selection order, and scene options"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        rig_obj = find_armature_for_autoaim(context)
+        if rig_obj is None:
+            self.report({"ERROR"}, "Select an armature with two target bones")
+            return {"CANCELLED"}
+
+        selected_names, active_name = get_selected_bone_names_for_autoaim(context, rig_obj)
+        ok, result = prepare_autoaim_pose_selection(context, rig_obj, selected_names, active_name)
+        if not ok:
+            self.report({"ERROR"}, result)
+            return {"CANCELLED"}
+
+        scene = context.scene
+        previous_create_type = getattr(scene, "Create_Type", "MANUAL")
+        previous_name = getattr(scene, "Muscle_Name", "Muscle")
+        previous_active, previous_selection = snapshot_selection(context)
+        before_names = {obj.name for obj in iter_scene_muscles(scene)}
+
+        try:
+            scene.Create_Type = "AUTOAIM"
+            if not getattr(scene, "Muscle_Name", "").strip():
+                scene.Muscle_Name = "Muscle"
+            bpy.ops.muscle.add_basic_muscle()
+        except RuntimeError as exc:
+            self.report({"ERROR"}, f"X-Muscle Auto Aim failed: {exc}")
+            return {"CANCELLED"}
+        finally:
+            scene.Create_Type = previous_create_type
+
+        after_muscles = iter_scene_muscles(scene)
+        created = [obj for obj in after_muscles if obj.name not in before_names]
+        if created:
+            created_muscle = created[-1]
+            settings = context.scene.xmuscle_range_baker
+            set_selected_muscles(settings, [created_muscle.name], active_name=created_muscle.name)
+            set_single_object_selection(context, created_muscle)
+            self.report({"INFO"}, f"Created {created_muscle.name} from selected bones")
+        else:
+            restore_selection(context, previous_active, previous_selection)
+            scene.Muscle_Name = previous_name
+            self.report({"WARNING"}, "No new muscle was detected after Auto Aim")
+        return {"FINISHED"}
+
+
 class XMRB_OT_select_muscle(bpy.types.Operator):
     bl_idname = "xmuscle_baker.select_muscle"
     bl_label = "Select Muscle"
@@ -1722,6 +1839,7 @@ class XMRB_OT_bake_range(bpy.types.Operator):
 CORE_CLASSES = (
     XMRB_Settings,
     XMRB_OT_guess_rig,
+    XMRB_OT_add_to_selected_bones,
     XMRB_OT_select_muscle,
     XMRB_OT_toggle_muscle_selection,
     XMRB_OT_activate_preview_animation,

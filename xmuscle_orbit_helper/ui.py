@@ -17,6 +17,8 @@ class XMRB_PT_panel(bpy.types.Panel):
         selected_names = set(core.get_selected_muscle_names(settings))
 
         col = layout.column(align=True)
+        col.operator("xmuscle_baker.add_to_selected_bones", icon="BONE_DATA", text="Add To Selected Bones")
+        col.separator()
         col.label(text="Scene Muscles")
         if not muscles:
             col.label(text="No X-Muscles found")
