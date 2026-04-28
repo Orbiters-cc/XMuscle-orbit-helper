@@ -69,6 +69,8 @@ class XMRB_PT_panel(bpy.types.Panel):
             all_op.muscle_name = muscle_obj.name
             select_op = actions.operator("xmuscle_baker.select_muscle", text="Only")
             select_op.muscle_name = muscle_obj.name
+            delete_op = actions.operator("xmuscle_baker.delete_muscle", text="", icon="TRASH")
+            delete_op.muscle_name = muscle_obj.name
             if core.infer_body_for_muscle(context.scene, muscle_obj) is None:
                 apply_row = box.row(align=True)
                 apply_op = apply_row.operator("xmuscle_baker.apply_muscle", text="Apply", icon="MOD_SHRINKWRAP")

@@ -243,6 +243,18 @@ def save_selection_settings_store(scene, data):
     scene[SELECTION_SETTINGS_PROP] = json.dumps(data)
 
 
+def remove_deleted_muscle_from_selection_store(scene, muscle_name):
+    store = get_selection_settings_store(scene)
+    cleaned = {}
+    for key, value in store.items():
+        names = [item for item in key.split("||") if item]
+        filtered = [name for name in names if name != muscle_name]
+        if not filtered:
+            continue
+        cleaned[selection_key_for_names(filtered)] = value
+    save_selection_settings_store(scene, cleaned)
+
+
 def serialize_settings(settings):
     return {
         "body_object_name": settings.body_object.name if settings.body_object else "",
@@ -785,6 +797,46 @@ def remove_preview_actions(prefix, muscle_obj, body_obj, rig_obj):
         action = bpy.data.actions.get(action_name)
         if action and action.users == 0:
             bpy.data.actions.remove(action)
+
+
+def remove_body_links_for_muscle(body_obj, muscle_obj):
+    if body_obj is None or muscle_obj is None:
+        return
+    to_remove = []
+    for modifier in body_obj.modifiers:
+        target = getattr(modifier, "target", None)
+        if modifier.type == "SHRINKWRAP" and target == muscle_obj:
+            to_remove.append(modifier)
+    for modifier in to_remove:
+        body_obj.modifiers.remove(modifier)
+
+
+def delete_muscle_system(context, muscle_obj, key_prefix):
+    if muscle_obj is None:
+        return False, "Muscle not found"
+
+    scene = context.scene
+    muscle_name = muscle_obj.name
+    body_obj = infer_body_for_muscle(scene, muscle_obj)
+    links = infer_links_for_muscle(scene, muscle_obj)
+    rig_obj = bpy.data.objects.get(links["rig_object_name"]) if links.get("rig_object_name") else None
+    collection = get_muscle_collection(muscle_obj)
+    elements = list(iter_muscle_elements(muscle_obj))
+
+    ensure_object_mode(context)
+    if body_obj is not None:
+        remove_shape_keys_for_muscle(context, body_obj, key_prefix, muscle_obj.name)
+        remove_preview_actions(key_prefix, muscle_obj, body_obj, rig_obj)
+        remove_body_links_for_muscle(body_obj, muscle_obj)
+
+    for obj in elements:
+        if bpy.data.objects.get(obj.name) is not None:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    if collection is not None and bpy.data.collections.get(collection.name) is not None:
+        bpy.data.collections.remove(collection)
+
+    return True, f"Deleted {muscle_name}"
 
 
 def evaluate_body_vertices(context, body_obj):
@@ -1663,6 +1715,36 @@ class XMRB_OT_apply_muscle(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class XMRB_OT_delete_muscle(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.delete_muscle"
+    bl_label = "Delete Muscle"
+    bl_description = "Delete this muscle system and its baked helper assets"
+    bl_options = {"REGISTER", "UNDO"}
+
+    muscle_name: StringProperty()
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        muscle_obj = bpy.data.objects.get(self.muscle_name)
+        if muscle_obj is None:
+            self.report({"ERROR"}, "Muscle not found")
+            return {"CANCELLED"}
+
+        selected_names = [name for name in get_selected_muscle_names(settings) if name != muscle_obj.name]
+        ok, message = delete_muscle_system(context, muscle_obj, settings.key_prefix)
+        if not ok:
+            self.report({"ERROR"}, message)
+            return {"CANCELLED"}
+
+        remove_deleted_muscle_from_selection_store(context.scene, self.muscle_name)
+        active_name = selected_names[0] if selected_names else ""
+        set_selected_muscles(settings, selected_names, active_name=active_name)
+        if not selected_names:
+            settings.rename_buffer = ""
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
 class XMRB_OT_set_muscle_visibility(bpy.types.Operator):
     bl_idname = "xmuscle_baker.set_muscle_visibility"
     bl_label = "Set Muscle Visibility"
@@ -2032,6 +2114,7 @@ CORE_CLASSES = (
     XMRB_OT_toggle_muscle_selection,
     XMRB_OT_select_muscle_elements,
     XMRB_OT_apply_muscle,
+    XMRB_OT_delete_muscle,
     XMRB_OT_set_muscle_visibility,
     XMRB_OT_activate_preview_animation,
     XMRB_OT_rename_muscle,
