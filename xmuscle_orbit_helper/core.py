@@ -583,13 +583,12 @@ def set_muscle_visibility_mode(muscle_obj, mode):
     show_through = mode == "SHOW_THROUGH"
     hidden = mode == "HIDE"
     for obj in elements:
-        obj.hide_viewport = hidden
+        if obj.type == "MESH":
+            obj.hide_viewport = hidden
+        else:
+            obj.hide_viewport = False
         if hasattr(obj, "show_in_front"):
             obj.show_in_front = show_through and not hidden
-    if hasattr(muscle_obj, "Muscle_View3D"):
-        muscle_obj.Muscle_View3D = not hidden
-    if hasattr(muscle_obj, "Micro_Controller_View3D"):
-        muscle_obj.Micro_Controller_View3D = (not hidden) and show_through and getattr(muscle_obj, "Micro_Controller", False)
 
 
 def set_all_muscles_visibility_mode(scene, mode):
