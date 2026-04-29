@@ -106,6 +106,31 @@ class XMRB_PT_panel(bpy.types.Panel):
         else:
             col.prop(settings, "bone_name")
 
+        if len(selected_names) == 1:
+            col.separator()
+            col.label(text="Selected Muscle Drivers")
+            if settings.selected_has_slide_driver:
+                slide_settings = col.column(align=True)
+                slide_settings.label(text="Slide Driver")
+                slide_settings.prop(settings, "selected_slide_driver_slide_axis", text="Slide Axis")
+                slide_settings.prop(settings, "selected_slide_driver_rotation_axis", text="Rotation Axis")
+                slide_settings.prop(settings, "selected_slide_driver_rotation_space", text="Space")
+                slide_settings.prop(settings, "selected_slide_driver_mode", text="Mode")
+                slide_settings.prop(settings, "selected_slide_driver_factor", text="Strength")
+                slide_zero_row = slide_settings.row(align=True)
+                slide_zero_row.prop(settings, "selected_slide_driver_zero", text="Zero")
+                slide_zero_row.operator("xmuscle_baker.capture_driver_zero", text="", icon="EYEDROPPER").target = "SLIDE"
+            if settings.selected_has_length_driver:
+                length_settings = col.column(align=True)
+                length_settings.label(text="Base Length Driver")
+                length_settings.prop(settings, "selected_length_driver_rotation_axis", text="Rotation Axis")
+                length_settings.prop(settings, "selected_length_driver_rotation_space", text="Space")
+                length_settings.prop(settings, "selected_length_driver_mode", text="Mode")
+                length_settings.prop(settings, "selected_length_driver_factor", text="Strength")
+                length_zero_row = length_settings.row(align=True)
+                length_zero_row.prop(settings, "selected_length_driver_zero", text="Zero")
+                length_zero_row.operator("xmuscle_baker.capture_driver_zero", text="", icon="EYEDROPPER").target = "LENGTH"
+
         col.separator()
         col.label(text="Motion Capture")
         col.prop(settings, "use_captured_pose")

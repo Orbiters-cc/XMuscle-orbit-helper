@@ -40,6 +40,20 @@ AXIS_ITEMS = (
 )
 
 
+DRIVER_MODE_ITEMS = (
+    ("RAW_DELTA", "Raw Delta", "Use the chosen Euler rotation channel minus the stored zero offset"),
+    ("WRAPPED_DELTA", "Wrapped Angle", "Use the shortest signed angle around the stored zero offset to avoid jumps near the working range"),
+    ("SINE", "Sine", "Use a smooth sine response of the chosen channel around the stored zero offset"),
+    ("COSINE", "Cosine", "Use a smooth cosine response of the chosen channel around the stored zero offset"),
+)
+
+
+DRIVER_SPACE_ITEMS = (
+    ("LOCAL_SPACE", "Local", "Read the driver source rotation in local bone space"),
+    ("WORLD_SPACE", "World", "Read the driver source rotation in world space"),
+)
+
+
 MUSCLE_SETTINGS_PROP = "_xmoh_settings"
 SELECTION_SETTINGS_PROP = "_xmoh_selection_settings"
 
@@ -215,6 +229,28 @@ def get_selected_scene_muscle(settings):
     return bpy.data.objects.get(settings.muscle_name)
 
 
+def get_muscle_system(muscle_obj):
+    if muscle_obj and muscle_obj.parent and muscle_obj.parent.type == "ARMATURE":
+        return muscle_obj.parent
+    return None
+
+
+def get_muscle_slide_bone_name(muscle_obj):
+    if muscle_obj is None:
+        return ""
+    return muscle_obj.get("xmuscle_orbit_slide_bone", "")
+
+
+def sample_bone_rotation_channel(rig_obj, bone_name, axis_name, rotation_space):
+    if rig_obj is None or rig_obj.type != "ARMATURE" or bone_name not in rig_obj.pose.bones:
+        return 0.0
+    pose_bone = rig_obj.pose.bones[bone_name]
+    if rotation_space == "WORLD_SPACE":
+        matrix = rig_obj.matrix_world @ pose_bone.matrix
+        return matrix.to_euler("XYZ")[axis_index(axis_name)]
+    return pose_bone.matrix_basis.to_euler("XYZ")[axis_index(axis_name)]
+
+
 def get_selected_muscle_names(settings):
     if not settings:
         return []
@@ -249,6 +285,16 @@ def axis_index(axis_name):
         "Y": 1,
         "Z": 2,
     }.get(axis_name, 0)
+
+
+def driver_expression_for_mode(mode):
+    if mode == "WRAPPED_DELTA":
+        return "atan2(sin(rot - zero), cos(rot - zero)) * factor"
+    if mode == "SINE":
+        return "sin(rot - zero) * factor"
+    if mode == "COSINE":
+        return "cos(rot - zero) * factor"
+    return "(rot - zero) * factor"
 
 
 def unique_bone_name(rig_obj, base_name):
@@ -439,6 +485,7 @@ def load_settings_for_selection(settings, muscle_names):
     apply_saved_settings(settings, payload)
     primary = bpy.data.objects.get(settings.muscle_name) or (bpy.data.objects.get(muscle_names[0]) if muscle_names else None)
     settings.rename_buffer = primary.name if primary is not None else ""
+    sync_selected_driver_settings(settings, primary if len(muscle_names) == 1 else None)
     save_selected_muscle_settings(settings)
 
 
@@ -458,7 +505,41 @@ def load_settings_for_muscle(settings, muscle_obj):
         payload.setdefault("bone_name", inferred.get("bone_name", ""))
     apply_saved_settings(settings, payload)
     settings.rename_buffer = muscle_obj.name if muscle_obj is not None else ""
+    sync_selected_driver_settings(settings, muscle_obj)
     save_selected_muscle_settings(settings)
+
+
+def sync_selected_driver_settings(settings, muscle_obj=None):
+    muscle_obj = muscle_obj or get_selected_scene_muscle(settings)
+    settings.sync_settings_lock = True
+    try:
+        slide_bone_name = get_muscle_slide_bone_name(muscle_obj)
+        slide_bone = None
+        rig_obj = None
+        if slide_bone_name:
+            links = infer_links_for_muscle(bpy.context.scene, muscle_obj)
+            rig_obj = bpy.data.objects.get(links["rig_object_name"]) if links.get("rig_object_name") else None
+            if rig_obj and slide_bone_name in rig_obj.pose.bones:
+                slide_bone = rig_obj.pose.bones[slide_bone_name]
+
+        settings.selected_has_slide_driver = slide_bone is not None
+        settings.selected_slide_driver_slide_axis = slide_bone.get("xmuscle_slide_axis", "Y") if slide_bone else "Y"
+        settings.selected_slide_driver_rotation_axis = slide_bone.get("xmuscle_rotation_axis", "X") if slide_bone else "X"
+        settings.selected_slide_driver_factor = float(slide_bone.get("xmuscle_slide_factor", 1.0)) if slide_bone else 1.0
+        settings.selected_slide_driver_rotation_space = slide_bone.get("xmuscle_rotation_space", "LOCAL_SPACE") if slide_bone else "LOCAL_SPACE"
+        settings.selected_slide_driver_mode = slide_bone.get("xmuscle_slide_driver_mode", "RAW_DELTA") if slide_bone else "RAW_DELTA"
+        settings.selected_slide_driver_zero = float(slide_bone.get("xmuscle_slide_zero", 0.0)) if slide_bone else 0.0
+
+        muscle_sys = get_muscle_system(muscle_obj)
+        has_length = muscle_sys is not None and "xmuscle_length_driver_axis" in muscle_sys.keys()
+        settings.selected_has_length_driver = has_length
+        settings.selected_length_driver_rotation_axis = muscle_sys.get("xmuscle_length_driver_axis", "X") if has_length else "X"
+        settings.selected_length_driver_factor = float(muscle_sys.get("xmuscle_length_driver_factor", 0.15)) if has_length else 0.15
+        settings.selected_length_driver_rotation_space = muscle_sys.get("xmuscle_length_driver_space", "LOCAL_SPACE") if has_length else "LOCAL_SPACE"
+        settings.selected_length_driver_mode = muscle_sys.get("xmuscle_length_driver_mode", "RAW_DELTA") if has_length else "RAW_DELTA"
+        settings.selected_length_driver_zero = float(muscle_sys.get("xmuscle_length_driver_zero", 0.0)) if has_length else 0.0
+    finally:
+        settings.sync_settings_lock = False
 
 
 def find_preview_actions(settings, muscle_obj=None):
@@ -556,6 +637,9 @@ def create_slide_driver_bone(
         pose_bone["xmuscle_slide_source_bone"] = source_bone_name
         pose_bone["xmuscle_slide_axis"] = slide_axis
         pose_bone["xmuscle_rotation_axis"] = rotation_axis
+        pose_bone["xmuscle_rotation_space"] = "LOCAL_SPACE"
+        pose_bone["xmuscle_slide_driver_mode"] = "RAW_DELTA"
+        pose_bone["xmuscle_slide_zero"] = 0.0
 
         try:
             ui_data = pose_bone.id_properties_ui("xmuscle_slide_factor")
@@ -619,10 +703,13 @@ def create_base_length_driver(muscle_obj, rig_obj, source_bone_name, rotation_ax
     if source_bone_name not in rig_obj.data.bones:
         return False, f"Source bone {source_bone_name} was not found"
 
-    muscle_sys["xmuscle_length_driver_factor"] = factor
-    muscle_sys["xmuscle_length_driver_base"] = float(getattr(muscle_sys, "Base_Length", 1.0))
-    muscle_sys["xmuscle_length_driver_source_bone"] = source_bone_name
-    muscle_sys["xmuscle_length_driver_axis"] = rotation_axis
+        muscle_sys["xmuscle_length_driver_factor"] = factor
+        muscle_sys["xmuscle_length_driver_base"] = float(getattr(muscle_sys, "Base_Length", 1.0))
+        muscle_sys["xmuscle_length_driver_source_bone"] = source_bone_name
+        muscle_sys["xmuscle_length_driver_axis"] = rotation_axis
+        muscle_sys["xmuscle_length_driver_space"] = "LOCAL_SPACE"
+        muscle_sys["xmuscle_length_driver_mode"] = "RAW_DELTA"
+        muscle_sys["xmuscle_length_driver_zero"] = 0.0
 
     try:
         factor_ui = muscle_sys.id_properties_ui("xmuscle_length_driver_factor")
@@ -677,6 +764,125 @@ def create_base_length_driver(muscle_obj, rig_obj, source_bone_name, rotation_ax
     return True, muscle_sys.name
 
 
+def rebuild_slide_driver(rig_obj, slide_bone_name):
+    if rig_obj is None or rig_obj.type != "ARMATURE":
+        return False, "No valid armature was found"
+    if slide_bone_name not in rig_obj.pose.bones:
+        return False, "Slide bone not found"
+
+    pose_bone = rig_obj.pose.bones[slide_bone_name]
+    source_bone_name = pose_bone.get("xmuscle_slide_source_bone", "")
+    slide_axis = pose_bone.get("xmuscle_slide_axis", "Y")
+    rotation_axis = pose_bone.get("xmuscle_rotation_axis", "X")
+    rotation_space = pose_bone.get("xmuscle_rotation_space", "LOCAL_SPACE")
+    driver_mode = pose_bone.get("xmuscle_slide_driver_mode", "RAW_DELTA")
+
+    if source_bone_name not in rig_obj.data.bones:
+        return False, f"Source bone {source_bone_name} was not found"
+
+    animation_data = rig_obj.animation_data
+    if animation_data:
+        for fcurve in list(animation_data.drivers):
+            if fcurve.data_path == f'pose.bones["{slide_bone_name}"].location':
+                rig_obj.driver_remove(fcurve.data_path, fcurve.array_index)
+
+    location_index = axis_index(slide_axis)
+    fcurve = pose_bone.driver_add("location", location_index)
+    driver = fcurve.driver
+    driver.type = "SCRIPTED"
+    while driver.variables:
+        driver.variables.remove(driver.variables[0])
+
+    rot_var = driver.variables.new()
+    rot_var.name = "rot"
+    rot_var.type = "TRANSFORMS"
+    rot_target = rot_var.targets[0]
+    rot_target.id = rig_obj
+    rot_target.bone_target = source_bone_name
+    rot_target.transform_type = rotation_transform_type(rotation_axis)
+    rot_target.transform_space = rotation_space
+
+    factor_var = driver.variables.new()
+    factor_var.name = "factor"
+    factor_var.type = "SINGLE_PROP"
+    factor_target = factor_var.targets[0]
+    factor_target.id = rig_obj
+    factor_target.data_path = f'pose.bones["{slide_bone_name}"]["xmuscle_slide_factor"]'
+
+    zero_var = driver.variables.new()
+    zero_var.name = "zero"
+    zero_var.type = "SINGLE_PROP"
+    zero_target = zero_var.targets[0]
+    zero_target.id = rig_obj
+    zero_target.data_path = f'pose.bones["{slide_bone_name}"]["xmuscle_slide_zero"]'
+
+    driver.expression = driver_expression_for_mode(driver_mode)
+    return True, slide_bone_name
+
+
+def rebuild_base_length_driver(muscle_obj):
+    muscle_sys = get_muscle_system(muscle_obj)
+    if muscle_sys is None:
+        return False, "Muscle system armature was not found"
+
+    source_bone_name = muscle_sys.get("xmuscle_length_driver_source_bone", "")
+    rotation_axis = muscle_sys.get("xmuscle_length_driver_axis", "X")
+    rotation_space = muscle_sys.get("xmuscle_length_driver_space", "LOCAL_SPACE")
+    driver_mode = muscle_sys.get("xmuscle_length_driver_mode", "RAW_DELTA")
+    links = infer_links_for_muscle(bpy.context.scene, muscle_obj)
+    rig_obj = bpy.data.objects.get(links["rig_object_name"]) if links.get("rig_object_name") else None
+    if rig_obj is None or rig_obj.type != "ARMATURE":
+        return False, "Source rig was not found"
+    if source_bone_name not in rig_obj.data.bones:
+        return False, f"Source bone {source_bone_name} was not found"
+
+    animation_data = muscle_sys.animation_data
+    if animation_data:
+        for fcurve in list(animation_data.drivers):
+            if fcurve.data_path == "Base_Length":
+                muscle_sys.driver_remove("Base_Length")
+                break
+
+    fcurve = muscle_sys.driver_add("Base_Length")
+    driver = fcurve.driver
+    driver.type = "SCRIPTED"
+    while driver.variables:
+        driver.variables.remove(driver.variables[0])
+
+    rot_var = driver.variables.new()
+    rot_var.name = "rot"
+    rot_var.type = "TRANSFORMS"
+    rot_target = rot_var.targets[0]
+    rot_target.id = rig_obj
+    rot_target.bone_target = source_bone_name
+    rot_target.transform_type = rotation_transform_type(rotation_axis)
+    rot_target.transform_space = rotation_space
+
+    factor_var = driver.variables.new()
+    factor_var.name = "factor"
+    factor_var.type = "SINGLE_PROP"
+    factor_target = factor_var.targets[0]
+    factor_target.id = muscle_sys
+    factor_target.data_path = '["xmuscle_length_driver_factor"]'
+
+    base_var = driver.variables.new()
+    base_var.name = "base"
+    base_var.type = "SINGLE_PROP"
+    base_target = base_var.targets[0]
+    base_target.id = muscle_sys
+    base_target.data_path = '["xmuscle_length_driver_base"]'
+
+    zero_var = driver.variables.new()
+    zero_var.name = "zero"
+    zero_var.type = "SINGLE_PROP"
+    zero_target = zero_var.targets[0]
+    zero_target.id = muscle_sys
+    zero_target.data_path = '["xmuscle_length_driver_zero"]'
+
+    driver.expression = f"base + ({driver_expression_for_mode(driver_mode)})"
+    return True, muscle_sys.name
+
+
 def delete_bone_by_name(context, rig_obj, bone_name):
     if rig_obj is None or rig_obj.type != "ARMATURE" or not bone_name:
         return
@@ -704,6 +910,38 @@ def delete_bone_by_name(context, rig_obj, bone_name):
 def settings_changed(self, _context):
     if getattr(self, "sync_settings_lock", False):
         return
+    save_selected_muscle_settings(self)
+
+
+def selected_driver_settings_changed(self, _context):
+    if getattr(self, "sync_settings_lock", False):
+        return
+    muscle_obj = get_selected_scene_muscle(self)
+    if muscle_obj is None:
+        return
+
+    slide_bone_name = get_muscle_slide_bone_name(muscle_obj)
+    if self.selected_has_slide_driver and slide_bone_name:
+        links = infer_links_for_muscle(bpy.context.scene, muscle_obj)
+        rig_obj = bpy.data.objects.get(links["rig_object_name"]) if links.get("rig_object_name") else None
+        if rig_obj and slide_bone_name in rig_obj.pose.bones:
+            pose_bone = rig_obj.pose.bones[slide_bone_name]
+            pose_bone["xmuscle_slide_axis"] = self.selected_slide_driver_slide_axis
+            pose_bone["xmuscle_rotation_axis"] = self.selected_slide_driver_rotation_axis
+            pose_bone["xmuscle_slide_factor"] = self.selected_slide_driver_factor
+            pose_bone["xmuscle_rotation_space"] = self.selected_slide_driver_rotation_space
+            pose_bone["xmuscle_slide_driver_mode"] = self.selected_slide_driver_mode
+            pose_bone["xmuscle_slide_zero"] = self.selected_slide_driver_zero
+            rebuild_slide_driver(rig_obj, slide_bone_name)
+
+    muscle_sys = get_muscle_system(muscle_obj)
+    if self.selected_has_length_driver and muscle_sys is not None:
+        muscle_sys["xmuscle_length_driver_axis"] = self.selected_length_driver_rotation_axis
+        muscle_sys["xmuscle_length_driver_factor"] = self.selected_length_driver_factor
+        muscle_sys["xmuscle_length_driver_space"] = self.selected_length_driver_rotation_space
+        muscle_sys["xmuscle_length_driver_mode"] = self.selected_length_driver_mode
+        muscle_sys["xmuscle_length_driver_zero"] = self.selected_length_driver_zero
+        rebuild_base_length_driver(muscle_obj)
     save_selected_muscle_settings(self)
 
 
@@ -1737,6 +1975,101 @@ class XMRB_Settings(bpy.types.PropertyGroup):
         soft_max=5.0,
         update=settings_changed,
     )
+    selected_has_slide_driver: BoolProperty(
+        name="Has Slide Driver",
+        default=False,
+    )
+    selected_slide_driver_slide_axis: EnumProperty(
+        name="Slide Driver Slide Axis",
+        description="Edit the local slide axis used by the selected muscle's helper slide bone",
+        items=AXIS_ITEMS,
+        default="Y",
+        update=selected_driver_settings_changed,
+    )
+    selected_slide_driver_rotation_axis: EnumProperty(
+        name="Slide Driver Rotation Axis",
+        description="Edit which local rotation axis drives the selected muscle's helper slide bone",
+        items=AXIS_ITEMS,
+        default="X",
+        update=selected_driver_settings_changed,
+    )
+    selected_slide_driver_factor: FloatProperty(
+        name="Slide Driver Strength",
+        description="Edit the multiplier used by the selected muscle's helper slide bone driver",
+        default=1.0,
+        min=-100.0,
+        max=100.0,
+        soft_min=-20.0,
+        soft_max=20.0,
+        update=selected_driver_settings_changed,
+    )
+    selected_slide_driver_rotation_space: EnumProperty(
+        name="Slide Driver Space",
+        description="Choose whether the selected muscle's slide driver reads the source bone in local or world rotation space",
+        items=DRIVER_SPACE_ITEMS,
+        default="LOCAL_SPACE",
+        update=selected_driver_settings_changed,
+    )
+    selected_slide_driver_mode: EnumProperty(
+        name="Slide Driver Mode",
+        description="Choose how the selected muscle's slide driver evaluates the source rotation",
+        items=DRIVER_MODE_ITEMS,
+        default="RAW_DELTA",
+        update=selected_driver_settings_changed,
+    )
+    selected_slide_driver_zero: FloatProperty(
+        name="Slide Driver Zero",
+        description="Shift the selected muscle slide driver's zero point on its source rotation channel",
+        default=0.0,
+        subtype="ANGLE",
+        soft_min=-6.283185307179586,
+        soft_max=6.283185307179586,
+        update=selected_driver_settings_changed,
+    )
+    selected_has_length_driver: BoolProperty(
+        name="Has Length Driver",
+        default=False,
+    )
+    selected_length_driver_rotation_axis: EnumProperty(
+        name="Length Driver Rotation Axis",
+        description="Edit which local rotation axis drives the selected muscle's X-Muscle Base Length",
+        items=AXIS_ITEMS,
+        default="X",
+        update=selected_driver_settings_changed,
+    )
+    selected_length_driver_factor: FloatProperty(
+        name="Length Driver Strength",
+        description="Edit the multiplier used by the selected muscle's X-Muscle Base Length driver",
+        default=0.15,
+        min=-100.0,
+        max=100.0,
+        soft_min=-20.0,
+        soft_max=20.0,
+        update=selected_driver_settings_changed,
+    )
+    selected_length_driver_rotation_space: EnumProperty(
+        name="Length Driver Space",
+        description="Choose whether the selected muscle's Base Length driver reads the source bone in local or world rotation space",
+        items=DRIVER_SPACE_ITEMS,
+        default="LOCAL_SPACE",
+        update=selected_driver_settings_changed,
+    )
+    selected_length_driver_mode: EnumProperty(
+        name="Length Driver Mode",
+        description="Choose how the selected muscle's Base Length driver evaluates the source rotation",
+        items=DRIVER_MODE_ITEMS,
+        default="RAW_DELTA",
+        update=selected_driver_settings_changed,
+    )
+    selected_length_driver_zero: FloatProperty(
+        name="Length Driver Zero",
+        description="Shift the selected muscle Base Length driver's zero point on its source rotation channel",
+        default=0.0,
+        subtype="ANGLE",
+        soft_min=-6.283185307179586,
+        soft_max=6.283185307179586,
+        update=selected_driver_settings_changed,
+    )
     auto_disable_unsupported_modifiers: BoolProperty(
         name="Auto-Disable Unsupported Modifiers",
         description="Temporarily disable body modifiers that can change topology or break shape key transfer, then restore them after the bake",
@@ -2283,6 +2616,66 @@ class XMRB_OT_capture_pose(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class XMRB_OT_capture_driver_zero(bpy.types.Operator):
+    bl_idname = "xmuscle_baker.capture_driver_zero"
+    bl_label = "Capture Driver Zero"
+    bl_description = "Use the current source bone rotation as the zero point for the selected muscle driver"
+
+    target: EnumProperty(
+        items=(
+            ("SLIDE", "Slide", ""),
+            ("LENGTH", "Length", ""),
+        )
+    )
+
+    def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
+        muscle_obj = get_selected_scene_muscle(settings)
+        if muscle_obj is None:
+            self.report({"ERROR"}, "Select a single muscle first")
+            return {"CANCELLED"}
+
+        links = infer_links_for_muscle(context.scene, muscle_obj)
+        rig_obj = bpy.data.objects.get(links["rig_object_name"]) if links.get("rig_object_name") else None
+        if rig_obj is None or rig_obj.type != "ARMATURE":
+            self.report({"ERROR"}, "Source rig not found for this muscle")
+            return {"CANCELLED"}
+
+        settings.sync_settings_lock = True
+        try:
+            if self.target == "SLIDE":
+                slide_bone_name = get_muscle_slide_bone_name(muscle_obj)
+                if not slide_bone_name or slide_bone_name not in rig_obj.pose.bones:
+                    self.report({"ERROR"}, "Selected muscle has no slide driver bone")
+                    return {"CANCELLED"}
+                slide_bone = rig_obj.pose.bones[slide_bone_name]
+                source_bone_name = slide_bone.get("xmuscle_slide_source_bone", "")
+                axis_name = slide_bone.get("xmuscle_rotation_axis", "X")
+                rotation_space = slide_bone.get("xmuscle_rotation_space", "LOCAL_SPACE")
+                zero_value = sample_bone_rotation_channel(rig_obj, source_bone_name, axis_name, rotation_space)
+                slide_bone["xmuscle_slide_zero"] = zero_value
+                settings.selected_slide_driver_zero = zero_value
+                rebuild_slide_driver(rig_obj, slide_bone_name)
+            else:
+                muscle_sys = get_muscle_system(muscle_obj)
+                if muscle_sys is None or "xmuscle_length_driver_source_bone" not in muscle_sys.keys():
+                    self.report({"ERROR"}, "Selected muscle has no Base Length driver")
+                    return {"CANCELLED"}
+                source_bone_name = muscle_sys.get("xmuscle_length_driver_source_bone", "")
+                axis_name = muscle_sys.get("xmuscle_length_driver_axis", "X")
+                rotation_space = muscle_sys.get("xmuscle_length_driver_space", "LOCAL_SPACE")
+                zero_value = sample_bone_rotation_channel(rig_obj, source_bone_name, axis_name, rotation_space)
+                muscle_sys["xmuscle_length_driver_zero"] = zero_value
+                settings.selected_length_driver_zero = zero_value
+                rebuild_base_length_driver(muscle_obj)
+        finally:
+            settings.sync_settings_lock = False
+
+        save_selected_muscle_settings(settings)
+        self.report({"INFO"}, "Driver zero captured from current pose")
+        return {"FINISHED"}
+
+
 class XMRB_OT_store_preview_base(bpy.types.Operator):
     bl_idname = "xmuscle_baker.store_preview_base"
     bl_label = "Store Current As Restore Pose"
@@ -2478,6 +2871,7 @@ CORE_CLASSES = (
     XMRB_OT_rename_muscle,
     XMRB_OT_bake_specific_muscle,
     XMRB_OT_capture_pose,
+    XMRB_OT_capture_driver_zero,
     XMRB_OT_store_preview_base,
     XMRB_OT_bake_range,
 )
