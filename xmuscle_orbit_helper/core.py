@@ -33,6 +33,13 @@ CAPTURE_ITEMS = (
 )
 
 
+AXIS_ITEMS = (
+    ("X", "X", ""),
+    ("Y", "Y", ""),
+    ("Z", "Z", ""),
+)
+
+
 MUSCLE_SETTINGS_PROP = "_xmoh_settings"
 SELECTION_SETTINGS_PROP = "_xmoh_selection_settings"
 
@@ -228,6 +235,34 @@ def selection_key_for_names(muscle_names):
     return "||".join(sorted(set(muscle_names)))
 
 
+def rotation_transform_type(axis_name):
+    return {
+        "X": "ROT_X",
+        "Y": "ROT_Y",
+        "Z": "ROT_Z",
+    }.get(axis_name, "ROT_X")
+
+
+def axis_index(axis_name):
+    return {
+        "X": 0,
+        "Y": 1,
+        "Z": 2,
+    }.get(axis_name, 0)
+
+
+def unique_bone_name(rig_obj, base_name):
+    existing = set(rig_obj.data.bones.keys())
+    if base_name not in existing:
+        return base_name
+    index = 1
+    while True:
+        candidate = f"{base_name}.{index:03d}"
+        if candidate not in existing:
+            return candidate
+        index += 1
+
+
 def get_selection_settings_store(scene):
     raw = scene.get(SELECTION_SETTINGS_PROP, "{}")
     try:
@@ -269,6 +304,10 @@ def serialize_settings(settings):
         "replace_target_on_rebake": settings.replace_target_on_rebake,
         "disable_subsurf": settings.disable_subsurf,
         "auto_apply_muscle": settings.auto_apply_muscle,
+        "create_slide_driver": settings.create_slide_driver,
+        "slide_driver_slide_axis": settings.slide_driver_slide_axis,
+        "slide_driver_rotation_axis": settings.slide_driver_rotation_axis,
+        "slide_driver_factor": settings.slide_driver_factor,
         "auto_disable_unsupported_modifiers": settings.auto_disable_unsupported_modifiers,
         "use_captured_pose": settings.use_captured_pose,
         "has_start_pose": settings.has_start_pose,
@@ -328,6 +367,10 @@ def apply_saved_settings(settings, payload):
         settings.replace_target_on_rebake = payload.get("replace_target_on_rebake", settings.replace_target_on_rebake)
         settings.disable_subsurf = payload.get("disable_subsurf", settings.disable_subsurf)
         settings.auto_apply_muscle = payload.get("auto_apply_muscle", settings.auto_apply_muscle)
+        settings.create_slide_driver = payload.get("create_slide_driver", settings.create_slide_driver)
+        settings.slide_driver_slide_axis = payload.get("slide_driver_slide_axis", settings.slide_driver_slide_axis)
+        settings.slide_driver_rotation_axis = payload.get("slide_driver_rotation_axis", settings.slide_driver_rotation_axis)
+        settings.slide_driver_factor = payload.get("slide_driver_factor", settings.slide_driver_factor)
         settings.auto_disable_unsupported_modifiers = payload.get("auto_disable_unsupported_modifiers", settings.auto_disable_unsupported_modifiers)
         settings.use_captured_pose = payload.get("use_captured_pose", settings.use_captured_pose)
         settings.has_start_pose = payload.get("has_start_pose", settings.has_start_pose)
@@ -455,6 +498,132 @@ def apply_muscle_to_body(context, muscle_obj, body_obj):
     if infer_body_for_muscle(context.scene, muscle_obj) != body_obj:
         return False, f"{muscle_obj.name} was created but is still not linked to {body_obj.name}"
     return True, f"Applied {muscle_obj.name} to {body_obj.name}"
+
+
+def create_slide_driver_bone(
+    context,
+    rig_obj,
+    parent_bone_name,
+    source_bone_name,
+    helper_bone_name,
+    slide_axis,
+    rotation_axis,
+    factor,
+):
+    if rig_obj is None or rig_obj.type != "ARMATURE":
+        return False, "No valid armature was found for slide driver creation"
+    if parent_bone_name not in rig_obj.data.bones:
+        return False, f"Parent bone {parent_bone_name} was not found"
+    if source_bone_name not in rig_obj.data.bones:
+        return False, f"Source bone {source_bone_name} was not found"
+
+    previous_active, previous_selection = snapshot_selection(context)
+    previous_mode = context.mode
+    created_name = ""
+
+    try:
+        ensure_object_mode(context)
+        set_single_object_selection(context, rig_obj)
+        bpy.ops.object.mode_set(mode="EDIT")
+
+        edit_bones = rig_obj.data.edit_bones
+        parent_edit = edit_bones[parent_bone_name]
+        created_name = unique_bone_name(rig_obj, helper_bone_name)
+        helper_edit = edit_bones.new(created_name)
+        helper_edit.parent = parent_edit
+        helper_edit.use_connect = False
+        helper_edit.use_deform = False
+        helper_edit.head = parent_edit.tail.copy()
+
+        parent_vector = parent_edit.tail - parent_edit.head
+        if parent_vector.length < 1e-5:
+            parent_vector = Vector((0.0, 0.05, 0.0))
+        helper_edit.tail = helper_edit.head + parent_vector.normalized() * max(parent_vector.length * 0.25, 0.05)
+        helper_edit.roll = parent_edit.roll
+
+        bpy.ops.object.mode_set(mode="POSE")
+        pose_bone = rig_obj.pose.bones[created_name]
+        pose_bone.rotation_mode = "XYZ"
+        pose_bone.location = (0.0, 0.0, 0.0)
+        pose_bone["xmuscle_slide_factor"] = factor
+        pose_bone["xmuscle_slide_parent_bone"] = parent_bone_name
+        pose_bone["xmuscle_slide_source_bone"] = source_bone_name
+        pose_bone["xmuscle_slide_axis"] = slide_axis
+        pose_bone["xmuscle_rotation_axis"] = rotation_axis
+
+        try:
+            ui_data = pose_bone.id_properties_ui("xmuscle_slide_factor")
+            ui_data.update(
+                min=-100.0,
+                max=100.0,
+                soft_min=-20.0,
+                soft_max=20.0,
+                description="Strength of the X-Muscle Orbit slide driver",
+            )
+        except Exception:
+            pass
+
+        location_index = axis_index(slide_axis)
+        fcurve = pose_bone.driver_add("location", location_index)
+        driver = fcurve.driver
+        driver.type = "SCRIPTED"
+        while driver.variables:
+            driver.variables.remove(driver.variables[0])
+
+        rot_var = driver.variables.new()
+        rot_var.name = "rot"
+        rot_var.type = "TRANSFORMS"
+        rot_target = rot_var.targets[0]
+        rot_target.id = rig_obj
+        rot_target.bone_target = source_bone_name
+        rot_target.transform_type = rotation_transform_type(rotation_axis)
+        rot_target.transform_space = "LOCAL_SPACE"
+
+        factor_var = driver.variables.new()
+        factor_var.name = "factor"
+        factor_var.type = "SINGLE_PROP"
+        factor_target = factor_var.targets[0]
+        factor_target.id = rig_obj
+        factor_target.data_path = f'pose.bones["{created_name}"]["xmuscle_slide_factor"]'
+
+        driver.expression = "rot * factor"
+    except RuntimeError as exc:
+        return False, f"Failed to create slide driver bone: {exc}"
+    finally:
+        try:
+            if previous_mode == "POSE" and context.object == rig_obj:
+                bpy.ops.object.mode_set(mode="POSE")
+            else:
+                bpy.ops.object.mode_set(mode="OBJECT")
+        except RuntimeError:
+            pass
+        restore_selection(context, previous_active, previous_selection)
+
+    return True, created_name
+
+
+def delete_bone_by_name(context, rig_obj, bone_name):
+    if rig_obj is None or rig_obj.type != "ARMATURE" or not bone_name:
+        return
+    if bone_name not in rig_obj.data.bones:
+        return
+
+    previous_active, previous_selection = snapshot_selection(context)
+    try:
+        ensure_object_mode(context)
+        set_single_object_selection(context, rig_obj)
+        bpy.ops.object.mode_set(mode="EDIT")
+        edit_bone = rig_obj.data.edit_bones.get(bone_name)
+        if edit_bone is not None:
+            rig_obj.data.edit_bones.remove(edit_bone)
+    except RuntimeError:
+        pass
+    finally:
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except RuntimeError:
+            pass
+        restore_selection(context, previous_active, previous_selection)
 
 
 def settings_changed(self, _context):
@@ -816,6 +985,7 @@ def delete_muscle_system(context, muscle_obj, key_prefix):
 
     scene = context.scene
     muscle_name = muscle_obj.name
+    slide_bone_name = muscle_obj.get("xmuscle_orbit_slide_bone", "")
     body_obj = infer_body_for_muscle(scene, muscle_obj)
     links = infer_links_for_muscle(scene, muscle_obj)
     rig_obj = bpy.data.objects.get(links["rig_object_name"]) if links.get("rig_object_name") else None
@@ -834,6 +1004,9 @@ def delete_muscle_system(context, muscle_obj, key_prefix):
 
     if collection is not None and bpy.data.collections.get(collection.name) is not None:
         bpy.data.collections.remove(collection)
+
+    if slide_bone_name:
+        delete_bone_by_name(context, rig_obj, slide_bone_name)
 
     return True, f"Deleted {muscle_name}"
 
@@ -1436,6 +1609,36 @@ class XMRB_Settings(bpy.types.PropertyGroup):
         default=True,
         update=settings_changed,
     )
+    create_slide_driver: BoolProperty(
+        name="Add Slide Driver Bone",
+        description="When adding a muscle from a 2-bone Auto Aim selection, create a helper bone on the first bone that slides from the second bone's rotation",
+        default=False,
+        update=settings_changed,
+    )
+    slide_driver_slide_axis: EnumProperty(
+        name="Slide Axis",
+        description="Which local translation axis the new helper bone should slide on",
+        items=AXIS_ITEMS,
+        default="Y",
+        update=settings_changed,
+    )
+    slide_driver_rotation_axis: EnumProperty(
+        name="Source Rotation Axis",
+        description="Which local rotation axis of the second selected bone should drive the slide motion",
+        items=AXIS_ITEMS,
+        default="X",
+        update=settings_changed,
+    )
+    slide_driver_factor: FloatProperty(
+        name="Slide Strength",
+        description="Initial multiplier applied between the source rotation and the helper bone slide; can be edited later on the created helper bone custom property",
+        default=1.0,
+        min=-20.0,
+        max=20.0,
+        soft_min=-10.0,
+        soft_max=10.0,
+        update=settings_changed,
+    )
     auto_disable_unsupported_modifiers: BoolProperty(
         name="Auto-Disable Unsupported Modifiers",
         description="Temporarily disable body modifiers that can change topology or break shape key transfer, then restore them after the bake",
@@ -1557,10 +1760,13 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
     )
 
     def execute(self, context):
+        settings = context.scene.xmuscle_range_baker
         rig_obj = find_armature_for_autoaim(context)
         selected_names = []
         active_name = ""
         use_autoaim = False
+        ordered_bones = []
+        created_slide_bone_name = ""
         operator_map = {
             "BASIC": bpy.ops.muscle.add_basic_muscle,
             "STYLIZED": bpy.ops.muscle.add_muscle,
@@ -1571,10 +1777,34 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
             selected_names, active_name = get_selected_bone_names_for_autoaim(context, rig_obj)
             use_autoaim = len(selected_names) == 2 and bool(active_name)
             if use_autoaim:
+                ordered_bones = [name for name in selected_names if name != active_name]
+                ordered_bones.append(active_name)
+                if settings.create_slide_driver:
+                    helper_base_name = f"{getattr(context.scene, 'Muscle_Name', 'Muscle')}_slide"
+                    ok, slide_result = create_slide_driver_bone(
+                        context,
+                        rig_obj,
+                        ordered_bones[0],
+                        ordered_bones[1],
+                        helper_base_name,
+                        settings.slide_driver_slide_axis,
+                        settings.slide_driver_rotation_axis,
+                        settings.slide_driver_factor,
+                    )
+                    if not ok:
+                        self.report({"ERROR"}, slide_result)
+                        return {"CANCELLED"}
+                    created_slide_bone_name = slide_result
+                    selected_names = [ordered_bones[0], created_slide_bone_name]
+                    active_name = created_slide_bone_name
+
                 ok, result = prepare_autoaim_pose_selection(context, rig_obj, selected_names, active_name)
                 if not ok:
+                    if created_slide_bone_name:
+                        delete_bone_by_name(context, rig_obj, created_slide_bone_name)
                     self.report({"ERROR"}, result)
                     return {"CANCELLED"}
+                ordered_bones = result
         else:
             ensure_object_mode(context)
 
@@ -1590,6 +1820,8 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
                 scene.Muscle_Name = "Muscle"
             operator_map[self.muscle_type]()
         except RuntimeError as exc:
+            if created_slide_bone_name:
+                delete_bone_by_name(context, rig_obj, created_slide_bone_name)
             self.report({"ERROR"}, f"X-Muscle creation failed: {exc}")
             return {"CANCELLED"}
         finally:
@@ -1599,7 +1831,8 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
         created = [obj for obj in after_muscles if obj.name not in before_names]
         if created:
             created_muscle = created[-1]
-            settings = context.scene.xmuscle_range_baker
+            if created_slide_bone_name:
+                created_muscle["xmuscle_orbit_slide_bone"] = created_slide_bone_name
             ensure_default_body_object(settings, scene)
             set_selected_muscles(settings, [created_muscle.name], active_name=created_muscle.name)
             set_single_object_selection(context, created_muscle)
@@ -1610,10 +1843,19 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
                 if not ok:
                     self.report({"WARNING"}, f"Created {created_muscle.name} ({creation_mode}), but {message}")
                     return {"FINISHED"}
-                self.report({"INFO"}, f"Created {created_muscle.name} ({creation_mode}) and applied it to {target_body.name}")
+                report_message = f"Created {created_muscle.name} ({creation_mode}) and applied it to {target_body.name}"
             else:
-                self.report({"WARNING"}, f"Created {created_muscle.name} ({creation_mode}), but no target Body mesh is set")
+                report_message = f"Created {created_muscle.name} ({creation_mode}), but no target Body mesh is set"
+
+            if created_slide_bone_name:
+                report_message += f"; muscle attached to slide bone {created_slide_bone_name}"
+            elif settings.create_slide_driver:
+                report_message += "; slide bone skipped (requires a valid 2-bone Auto Aim selection)"
+
+            self.report({"INFO"} if target_body is not None else {"WARNING"}, report_message)
         else:
+            if created_slide_bone_name:
+                delete_bone_by_name(context, rig_obj, created_slide_bone_name)
             restore_selection(context, previous_active, previous_selection)
             scene.Muscle_Name = previous_name
             self.report({"WARNING"}, "No new muscle was detected after creation")

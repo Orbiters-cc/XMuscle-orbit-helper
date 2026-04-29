@@ -25,6 +25,12 @@ class XMRB_PT_panel(bpy.types.Panel):
         col.prop(settings, "body_object", text="Apply To")
         if settings.body_object is None and effective_body is not None:
             col.label(text=f"Default: {effective_body.name}", icon="INFO")
+        col.prop(settings, "create_slide_driver")
+        if settings.create_slide_driver:
+            slide_col = col.column(align=True)
+            slide_col.prop(settings, "slide_driver_slide_axis", text="Slide Axis")
+            slide_col.prop(settings, "slide_driver_rotation_axis", text="Rotation Axis")
+            slide_col.prop(settings, "slide_driver_factor", text="Strength")
         add_row = col.row(align=True)
         add_op = add_row.operator("xmuscle_baker.add_muscle", text="Normal", icon="MESH_UVSPHERE")
         add_op.muscle_type = "BASIC"
