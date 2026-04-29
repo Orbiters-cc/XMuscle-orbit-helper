@@ -308,6 +308,9 @@ def serialize_settings(settings):
         "slide_driver_slide_axis": settings.slide_driver_slide_axis,
         "slide_driver_rotation_axis": settings.slide_driver_rotation_axis,
         "slide_driver_factor": settings.slide_driver_factor,
+        "create_length_driver": settings.create_length_driver,
+        "length_driver_rotation_axis": settings.length_driver_rotation_axis,
+        "length_driver_factor": settings.length_driver_factor,
         "auto_disable_unsupported_modifiers": settings.auto_disable_unsupported_modifiers,
         "use_captured_pose": settings.use_captured_pose,
         "has_start_pose": settings.has_start_pose,
@@ -371,6 +374,9 @@ def apply_saved_settings(settings, payload):
         settings.slide_driver_slide_axis = payload.get("slide_driver_slide_axis", settings.slide_driver_slide_axis)
         settings.slide_driver_rotation_axis = payload.get("slide_driver_rotation_axis", settings.slide_driver_rotation_axis)
         settings.slide_driver_factor = payload.get("slide_driver_factor", settings.slide_driver_factor)
+        settings.create_length_driver = payload.get("create_length_driver", settings.create_length_driver)
+        settings.length_driver_rotation_axis = payload.get("length_driver_rotation_axis", settings.length_driver_rotation_axis)
+        settings.length_driver_factor = payload.get("length_driver_factor", settings.length_driver_factor)
         settings.auto_disable_unsupported_modifiers = payload.get("auto_disable_unsupported_modifiers", settings.auto_disable_unsupported_modifiers)
         settings.use_captured_pose = payload.get("use_captured_pose", settings.use_captured_pose)
         settings.has_start_pose = payload.get("has_start_pose", settings.has_start_pose)
@@ -600,6 +606,75 @@ def create_slide_driver_bone(
         restore_selection(context, previous_active, previous_selection)
 
     return True, created_name
+
+
+def create_base_length_driver(muscle_obj, rig_obj, source_bone_name, rotation_axis, factor):
+    if muscle_obj is None or not getattr(muscle_obj, "Muscle_XID", False):
+        return False, "Muscle not found"
+    muscle_sys = muscle_obj.parent if muscle_obj.parent and muscle_obj.parent.type == "ARMATURE" else None
+    if muscle_sys is None:
+        return False, "Muscle system armature was not found"
+    if rig_obj is None or rig_obj.type != "ARMATURE":
+        return False, "No valid source rig was found"
+    if source_bone_name not in rig_obj.data.bones:
+        return False, f"Source bone {source_bone_name} was not found"
+
+    muscle_sys["xmuscle_length_driver_factor"] = factor
+    muscle_sys["xmuscle_length_driver_base"] = float(getattr(muscle_sys, "Base_Length", 1.0))
+    muscle_sys["xmuscle_length_driver_source_bone"] = source_bone_name
+    muscle_sys["xmuscle_length_driver_axis"] = rotation_axis
+
+    try:
+        factor_ui = muscle_sys.id_properties_ui("xmuscle_length_driver_factor")
+        factor_ui.update(
+            min=-100.0,
+            max=100.0,
+            soft_min=-10.0,
+            soft_max=10.0,
+            description="Strength of the X-Muscle Orbit Base Length driver",
+        )
+        base_ui = muscle_sys.id_properties_ui("xmuscle_length_driver_base")
+        base_ui.update(
+            min=0.0,
+            max=100.0,
+            soft_min=0.25,
+            soft_max=4.0,
+            description="Base offset used by the X-Muscle Orbit Base Length driver",
+        )
+    except Exception:
+        pass
+
+    fcurve = muscle_sys.driver_add("Base_Length")
+    driver = fcurve.driver
+    driver.type = "SCRIPTED"
+    while driver.variables:
+        driver.variables.remove(driver.variables[0])
+
+    rot_var = driver.variables.new()
+    rot_var.name = "rot"
+    rot_var.type = "TRANSFORMS"
+    rot_target = rot_var.targets[0]
+    rot_target.id = rig_obj
+    rot_target.bone_target = source_bone_name
+    rot_target.transform_type = rotation_transform_type(rotation_axis)
+    rot_target.transform_space = "LOCAL_SPACE"
+
+    factor_var = driver.variables.new()
+    factor_var.name = "factor"
+    factor_var.type = "SINGLE_PROP"
+    factor_target = factor_var.targets[0]
+    factor_target.id = muscle_sys
+    factor_target.data_path = '["xmuscle_length_driver_factor"]'
+
+    base_var = driver.variables.new()
+    base_var.name = "base"
+    base_var.type = "SINGLE_PROP"
+    base_target = base_var.targets[0]
+    base_target.id = muscle_sys
+    base_target.data_path = '["xmuscle_length_driver_base"]'
+
+    driver.expression = "base + rot * factor"
+    return True, muscle_sys.name
 
 
 def delete_bone_by_name(context, rig_obj, bone_name):
@@ -1639,6 +1714,29 @@ class XMRB_Settings(bpy.types.PropertyGroup):
         soft_max=10.0,
         update=settings_changed,
     )
+    create_length_driver: BoolProperty(
+        name="Add Length Driver",
+        description="When adding a muscle from a 2-bone Auto Aim selection, drive the X-Muscle Base Length from the original second selected bone rotation",
+        default=False,
+        update=settings_changed,
+    )
+    length_driver_rotation_axis: EnumProperty(
+        name="Length Rotation Axis",
+        description="Which local rotation axis of the original second selected bone should drive the X-Muscle Base Length",
+        items=AXIS_ITEMS,
+        default="X",
+        update=settings_changed,
+    )
+    length_driver_factor: FloatProperty(
+        name="Length Strength",
+        description="Initial multiplier applied between the source rotation and the X-Muscle Base Length; can be edited later on the created X-Muscle system custom property",
+        default=0.15,
+        min=-20.0,
+        max=20.0,
+        soft_min=-5.0,
+        soft_max=5.0,
+        update=settings_changed,
+    )
     auto_disable_unsupported_modifiers: BoolProperty(
         name="Auto-Disable Unsupported Modifiers",
         description="Temporarily disable body modifiers that can change topology or break shape key transfer, then restore them after the bake",
@@ -1767,6 +1865,7 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
         use_autoaim = False
         ordered_bones = []
         created_slide_bone_name = ""
+        length_driver_source_bone_name = ""
         operator_map = {
             "BASIC": bpy.ops.muscle.add_basic_muscle,
             "STYLIZED": bpy.ops.muscle.add_muscle,
@@ -1779,6 +1878,8 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
             if use_autoaim:
                 ordered_bones = [name for name in selected_names if name != active_name]
                 ordered_bones.append(active_name)
+                if len(ordered_bones) == 2:
+                    length_driver_source_bone_name = ordered_bones[1]
                 if settings.create_slide_driver:
                     helper_base_name = f"{getattr(context.scene, 'Muscle_Name', 'Muscle')}_slide"
                     ok, slide_result = create_slide_driver_bone(
@@ -1851,6 +1952,22 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
                 report_message += f"; muscle attached to slide bone {created_slide_bone_name}"
             elif settings.create_slide_driver:
                 report_message += "; slide bone skipped (requires a valid 2-bone Auto Aim selection)"
+
+            if settings.create_length_driver:
+                if use_autoaim and rig_obj is not None and length_driver_source_bone_name:
+                    ok, length_result = create_base_length_driver(
+                        created_muscle,
+                        rig_obj,
+                        length_driver_source_bone_name,
+                        settings.length_driver_rotation_axis,
+                        settings.length_driver_factor,
+                    )
+                    if ok:
+                        report_message += f"; Base Length driver added on {length_result}"
+                    else:
+                        report_message += f"; Base Length driver skipped ({length_result})"
+                else:
+                    report_message += "; Base Length driver skipped (requires a valid 2-bone Auto Aim selection)"
 
             self.report({"INFO"} if target_body is not None else {"WARNING"}, report_message)
         else:

@@ -31,6 +31,11 @@ class XMRB_PT_panel(bpy.types.Panel):
             slide_col.prop(settings, "slide_driver_slide_axis", text="Slide Axis")
             slide_col.prop(settings, "slide_driver_rotation_axis", text="Rotation Axis")
             slide_col.prop(settings, "slide_driver_factor", text="Strength")
+        col.prop(settings, "create_length_driver")
+        if settings.create_length_driver:
+            length_col = col.column(align=True)
+            length_col.prop(settings, "length_driver_rotation_axis", text="Rotation Axis")
+            length_col.prop(settings, "length_driver_factor", text="Strength")
         add_row = col.row(align=True)
         add_op = add_row.operator("xmuscle_baker.add_muscle", text="Normal", icon="MESH_UVSPHERE")
         add_op.muscle_type = "BASIC"
