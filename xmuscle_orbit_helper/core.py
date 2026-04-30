@@ -2393,6 +2393,7 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
             created_muscle = created[-1]
             if created_slide_bone_name:
                 created_muscle["xmuscle_orbit_slide_bone"] = created_slide_bone_name
+            set_muscle_visibility_mode(created_muscle, "SHOW_THROUGH")
             ensure_default_body_object(settings, scene)
             set_selected_muscles(settings, [created_muscle.name], active_name=created_muscle.name)
             set_single_object_selection(context, created_muscle)

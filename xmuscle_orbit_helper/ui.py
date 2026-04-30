@@ -45,6 +45,7 @@ class XMRB_PT_panel(bpy.types.Panel):
         add_op.muscle_type = "STYLIZED"
         add_op = add_row.operator("xmuscle_baker.add_muscle", text="Flat", icon="MESH_PLANE")
         add_op.muscle_type = "STRIP"
+        add_row.operator("xmuscle_baker.draw_muscle", text="Drawn", icon="GREASEPENCIL")
         col.separator()
         col.label(text="Scene Muscles")
         if not muscles:
