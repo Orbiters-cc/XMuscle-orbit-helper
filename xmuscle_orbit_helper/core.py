@@ -39,6 +39,17 @@ AXIS_ITEMS = (
     ("Z", "Z", ""),
 )
 
+AXIS_FLAG_ITEMS = (
+    ("X", "X", "", 1),
+    ("Y", "Y", "", 2),
+    ("Z", "Z", "", 4),
+)
+
+COMBINE_MODE_ITEMS = (
+    ("SUM", "Sum", "Sum the selected source rotation channels"),
+    ("AVERAGE", "Average", "Average the selected source rotation channels"),
+)
+
 
 DRIVER_MODE_ITEMS = (
     ("RAW_DELTA", "Raw Delta", "Use the chosen Euler rotation channel minus the stored zero offset"),
@@ -251,6 +262,11 @@ def sample_bone_rotation_channel(rig_obj, bone_name, axis_name, rotation_space):
     return pose_bone.matrix_basis.to_euler("XYZ")[axis_index(axis_name)]
 
 
+def sample_combined_bone_rotation(rig_obj, bone_name, axes, rotation_space, combine_mode):
+    values = [sample_bone_rotation_channel(rig_obj, bone_name, axis, rotation_space) for axis in normalize_axis_flags(axes)]
+    return combine_rotation_values(values, combine_mode)
+
+
 def get_selected_muscle_names(settings):
     if not settings:
         return []
@@ -287,14 +303,46 @@ def axis_index(axis_name):
     }.get(axis_name, 0)
 
 
-def driver_expression_for_mode(mode):
+def normalize_axis_flags(value):
+    if isinstance(value, str):
+        value = {value}
+    elif not value:
+        value = set()
+    axes = [axis for axis in ("X", "Y", "Z") if axis in value]
+    return axes or ["X"]
+
+
+def encode_axis_flags(axes):
+    return set(normalize_axis_flags(axes))
+
+
+def combined_rotation_expression(var_names, combine_mode):
+    active_vars = [name for name in var_names if name]
+    if not active_vars:
+        return "0.0"
+    joined = " + ".join(active_vars)
+    if len(active_vars) == 1 or combine_mode != "AVERAGE":
+        return joined
+    return f"(({joined}) / {len(active_vars)})"
+
+
+def combine_rotation_values(values, combine_mode):
+    if not values:
+        return 0.0
+    total = sum(values)
+    if combine_mode == "AVERAGE":
+        return total / len(values)
+    return total
+
+
+def driver_expression_for_mode(mode, rot_expr="rot"):
     if mode == "WRAPPED_DELTA":
-        return "atan2(sin(rot - zero), cos(rot - zero)) * factor"
+        return f"atan2(sin(({rot_expr}) - zero), cos(({rot_expr}) - zero)) * factor"
     if mode == "SINE":
-        return "sin(rot - zero) * factor"
+        return f"sin(({rot_expr}) - zero) * factor"
     if mode == "COSINE":
-        return "cos(rot - zero) * factor"
-    return "(rot - zero) * factor"
+        return f"cos(({rot_expr}) - zero) * factor"
+    return f"(({rot_expr}) - zero) * factor"
 
 
 def unique_bone_name(rig_obj, base_name):
@@ -352,10 +400,12 @@ def serialize_settings(settings):
         "auto_apply_muscle": settings.auto_apply_muscle,
         "create_slide_driver": settings.create_slide_driver,
         "slide_driver_slide_axis": settings.slide_driver_slide_axis,
-        "slide_driver_rotation_axis": settings.slide_driver_rotation_axis,
+        "slide_driver_rotation_axes": sorted(normalize_axis_flags(settings.slide_driver_rotation_axes)),
+        "slide_driver_combine_mode": settings.slide_driver_combine_mode,
         "slide_driver_factor": settings.slide_driver_factor,
         "create_length_driver": settings.create_length_driver,
-        "length_driver_rotation_axis": settings.length_driver_rotation_axis,
+        "length_driver_rotation_axes": sorted(normalize_axis_flags(settings.length_driver_rotation_axes)),
+        "length_driver_combine_mode": settings.length_driver_combine_mode,
         "length_driver_factor": settings.length_driver_factor,
         "auto_disable_unsupported_modifiers": settings.auto_disable_unsupported_modifiers,
         "use_captured_pose": settings.use_captured_pose,
@@ -418,10 +468,16 @@ def apply_saved_settings(settings, payload):
         settings.auto_apply_muscle = payload.get("auto_apply_muscle", settings.auto_apply_muscle)
         settings.create_slide_driver = payload.get("create_slide_driver", settings.create_slide_driver)
         settings.slide_driver_slide_axis = payload.get("slide_driver_slide_axis", settings.slide_driver_slide_axis)
-        settings.slide_driver_rotation_axis = payload.get("slide_driver_rotation_axis", settings.slide_driver_rotation_axis)
+        legacy_slide_axis = payload.get("slide_driver_rotation_axis", "X")
+        slide_axes = payload.get("slide_driver_rotation_axes", [legacy_slide_axis])
+        settings.slide_driver_rotation_axes = encode_axis_flags(slide_axes)
+        settings.slide_driver_combine_mode = payload.get("slide_driver_combine_mode", settings.slide_driver_combine_mode)
         settings.slide_driver_factor = payload.get("slide_driver_factor", settings.slide_driver_factor)
         settings.create_length_driver = payload.get("create_length_driver", settings.create_length_driver)
-        settings.length_driver_rotation_axis = payload.get("length_driver_rotation_axis", settings.length_driver_rotation_axis)
+        legacy_length_axis = payload.get("length_driver_rotation_axis", "X")
+        length_axes = payload.get("length_driver_rotation_axes", [legacy_length_axis])
+        settings.length_driver_rotation_axes = encode_axis_flags(length_axes)
+        settings.length_driver_combine_mode = payload.get("length_driver_combine_mode", settings.length_driver_combine_mode)
         settings.length_driver_factor = payload.get("length_driver_factor", settings.length_driver_factor)
         settings.auto_disable_unsupported_modifiers = payload.get("auto_disable_unsupported_modifiers", settings.auto_disable_unsupported_modifiers)
         settings.use_captured_pose = payload.get("use_captured_pose", settings.use_captured_pose)
@@ -524,16 +580,28 @@ def sync_selected_driver_settings(settings, muscle_obj=None):
 
         settings.selected_has_slide_driver = slide_bone is not None
         settings.selected_slide_driver_slide_axis = slide_bone.get("xmuscle_slide_axis", "Y") if slide_bone else "Y"
-        settings.selected_slide_driver_rotation_axis = slide_bone.get("xmuscle_rotation_axis", "X") if slide_bone else "X"
+        slide_axes_raw = slide_bone.get("xmuscle_rotation_axes", "") if slide_bone else ""
+        try:
+            slide_axes = json.loads(slide_axes_raw) if slide_axes_raw else [slide_bone.get("xmuscle_rotation_axis", "X")]
+        except Exception:
+            slide_axes = [slide_bone.get("xmuscle_rotation_axis", "X")] if slide_bone else ["X"]
+        settings.selected_slide_driver_rotation_axes = encode_axis_flags(slide_axes)
+        settings.selected_slide_driver_combine_mode = slide_bone.get("xmuscle_rotation_combine_mode", "SUM") if slide_bone else "SUM"
         settings.selected_slide_driver_factor = float(slide_bone.get("xmuscle_slide_factor", 1.0)) if slide_bone else 1.0
         settings.selected_slide_driver_rotation_space = slide_bone.get("xmuscle_rotation_space", "LOCAL_SPACE") if slide_bone else "LOCAL_SPACE"
         settings.selected_slide_driver_mode = slide_bone.get("xmuscle_slide_driver_mode", "RAW_DELTA") if slide_bone else "RAW_DELTA"
         settings.selected_slide_driver_zero = float(slide_bone.get("xmuscle_slide_zero", 0.0)) if slide_bone else 0.0
 
         muscle_sys = get_muscle_system(muscle_obj)
-        has_length = muscle_sys is not None and "xmuscle_length_driver_axis" in muscle_sys.keys()
+        has_length = muscle_sys is not None and ("xmuscle_length_driver_axis" in muscle_sys.keys() or "xmuscle_length_driver_axes" in muscle_sys.keys())
         settings.selected_has_length_driver = has_length
-        settings.selected_length_driver_rotation_axis = muscle_sys.get("xmuscle_length_driver_axis", "X") if has_length else "X"
+        length_axes_raw = muscle_sys.get("xmuscle_length_driver_axes", "") if has_length else ""
+        try:
+            length_axes = json.loads(length_axes_raw) if length_axes_raw else [muscle_sys.get("xmuscle_length_driver_axis", "X")]
+        except Exception:
+            length_axes = [muscle_sys.get("xmuscle_length_driver_axis", "X")] if has_length else ["X"]
+        settings.selected_length_driver_rotation_axes = encode_axis_flags(length_axes)
+        settings.selected_length_driver_combine_mode = muscle_sys.get("xmuscle_length_driver_combine_mode", "SUM") if has_length else "SUM"
         settings.selected_length_driver_factor = float(muscle_sys.get("xmuscle_length_driver_factor", 0.15)) if has_length else 0.15
         settings.selected_length_driver_rotation_space = muscle_sys.get("xmuscle_length_driver_space", "LOCAL_SPACE") if has_length else "LOCAL_SPACE"
         settings.selected_length_driver_mode = muscle_sys.get("xmuscle_length_driver_mode", "RAW_DELTA") if has_length else "RAW_DELTA"
@@ -594,7 +662,8 @@ def create_slide_driver_bone(
     source_bone_name,
     helper_bone_name,
     slide_axis,
-    rotation_axis,
+    rotation_axes,
+    combine_mode,
     factor,
 ):
     if rig_obj is None or rig_obj.type != "ARMATURE":
@@ -636,7 +705,8 @@ def create_slide_driver_bone(
         pose_bone["xmuscle_slide_parent_bone"] = parent_bone_name
         pose_bone["xmuscle_slide_source_bone"] = source_bone_name
         pose_bone["xmuscle_slide_axis"] = slide_axis
-        pose_bone["xmuscle_rotation_axis"] = rotation_axis
+        pose_bone["xmuscle_rotation_axes"] = json.dumps(normalize_axis_flags(rotation_axes))
+        pose_bone["xmuscle_rotation_combine_mode"] = combine_mode
         pose_bone["xmuscle_rotation_space"] = "LOCAL_SPACE"
         pose_bone["xmuscle_slide_driver_mode"] = "RAW_DELTA"
         pose_bone["xmuscle_slide_zero"] = 0.0
@@ -692,7 +762,7 @@ def create_slide_driver_bone(
     return True, created_name
 
 
-def create_base_length_driver(muscle_obj, rig_obj, source_bone_name, rotation_axis, factor):
+def create_base_length_driver(muscle_obj, rig_obj, source_bone_name, rotation_axes, combine_mode, factor):
     if muscle_obj is None or not getattr(muscle_obj, "Muscle_XID", False):
         return False, "Muscle not found"
     muscle_sys = muscle_obj.parent if muscle_obj.parent and muscle_obj.parent.type == "ARMATURE" else None
@@ -703,13 +773,14 @@ def create_base_length_driver(muscle_obj, rig_obj, source_bone_name, rotation_ax
     if source_bone_name not in rig_obj.data.bones:
         return False, f"Source bone {source_bone_name} was not found"
 
-        muscle_sys["xmuscle_length_driver_factor"] = factor
-        muscle_sys["xmuscle_length_driver_base"] = float(getattr(muscle_sys, "Base_Length", 1.0))
-        muscle_sys["xmuscle_length_driver_source_bone"] = source_bone_name
-        muscle_sys["xmuscle_length_driver_axis"] = rotation_axis
-        muscle_sys["xmuscle_length_driver_space"] = "LOCAL_SPACE"
-        muscle_sys["xmuscle_length_driver_mode"] = "RAW_DELTA"
-        muscle_sys["xmuscle_length_driver_zero"] = 0.0
+    muscle_sys["xmuscle_length_driver_factor"] = factor
+    muscle_sys["xmuscle_length_driver_base"] = float(getattr(muscle_sys, "Base_Length", 1.0))
+    muscle_sys["xmuscle_length_driver_source_bone"] = source_bone_name
+    muscle_sys["xmuscle_length_driver_axes"] = json.dumps(normalize_axis_flags(rotation_axes))
+    muscle_sys["xmuscle_length_driver_combine_mode"] = combine_mode
+    muscle_sys["xmuscle_length_driver_space"] = "LOCAL_SPACE"
+    muscle_sys["xmuscle_length_driver_mode"] = "RAW_DELTA"
+    muscle_sys["xmuscle_length_driver_zero"] = 0.0
 
     try:
         factor_ui = muscle_sys.id_properties_ui("xmuscle_length_driver_factor")
@@ -773,7 +844,12 @@ def rebuild_slide_driver(rig_obj, slide_bone_name):
     pose_bone = rig_obj.pose.bones[slide_bone_name]
     source_bone_name = pose_bone.get("xmuscle_slide_source_bone", "")
     slide_axis = pose_bone.get("xmuscle_slide_axis", "Y")
-    rotation_axis = pose_bone.get("xmuscle_rotation_axis", "X")
+    raw_axes = pose_bone.get("xmuscle_rotation_axes", "")
+    try:
+        rotation_axes = json.loads(raw_axes) if raw_axes else [pose_bone.get("xmuscle_rotation_axis", "X")]
+    except json.JSONDecodeError:
+        rotation_axes = [pose_bone.get("xmuscle_rotation_axis", "X")]
+    combine_mode = pose_bone.get("xmuscle_rotation_combine_mode", "SUM")
     rotation_space = pose_bone.get("xmuscle_rotation_space", "LOCAL_SPACE")
     driver_mode = pose_bone.get("xmuscle_slide_driver_mode", "RAW_DELTA")
 
@@ -793,14 +869,19 @@ def rebuild_slide_driver(rig_obj, slide_bone_name):
     while driver.variables:
         driver.variables.remove(driver.variables[0])
 
-    rot_var = driver.variables.new()
-    rot_var.name = "rot"
-    rot_var.type = "TRANSFORMS"
-    rot_target = rot_var.targets[0]
-    rot_target.id = rig_obj
-    rot_target.bone_target = source_bone_name
-    rot_target.transform_type = rotation_transform_type(rotation_axis)
-    rot_target.transform_space = rotation_space
+    axes = normalize_axis_flags(rotation_axes)
+    var_names = []
+    for axis_name in axes:
+        rot_var = driver.variables.new()
+        var_name = f"r{axis_name.lower()}"
+        rot_var.name = var_name
+        rot_var.type = "TRANSFORMS"
+        rot_target = rot_var.targets[0]
+        rot_target.id = rig_obj
+        rot_target.bone_target = source_bone_name
+        rot_target.transform_type = rotation_transform_type(axis_name)
+        rot_target.transform_space = rotation_space
+        var_names.append(var_name)
 
     factor_var = driver.variables.new()
     factor_var.name = "factor"
@@ -816,7 +897,7 @@ def rebuild_slide_driver(rig_obj, slide_bone_name):
     zero_target.id = rig_obj
     zero_target.data_path = f'pose.bones["{slide_bone_name}"]["xmuscle_slide_zero"]'
 
-    driver.expression = driver_expression_for_mode(driver_mode)
+    driver.expression = driver_expression_for_mode(driver_mode, combined_rotation_expression(var_names, combine_mode))
     return True, slide_bone_name
 
 
@@ -826,7 +907,12 @@ def rebuild_base_length_driver(muscle_obj):
         return False, "Muscle system armature was not found"
 
     source_bone_name = muscle_sys.get("xmuscle_length_driver_source_bone", "")
-    rotation_axis = muscle_sys.get("xmuscle_length_driver_axis", "X")
+    raw_axes = muscle_sys.get("xmuscle_length_driver_axes", "")
+    try:
+        rotation_axes = json.loads(raw_axes) if raw_axes else [muscle_sys.get("xmuscle_length_driver_axis", "X")]
+    except json.JSONDecodeError:
+        rotation_axes = [muscle_sys.get("xmuscle_length_driver_axis", "X")]
+    combine_mode = muscle_sys.get("xmuscle_length_driver_combine_mode", "SUM")
     rotation_space = muscle_sys.get("xmuscle_length_driver_space", "LOCAL_SPACE")
     driver_mode = muscle_sys.get("xmuscle_length_driver_mode", "RAW_DELTA")
     links = infer_links_for_muscle(bpy.context.scene, muscle_obj)
@@ -849,14 +935,19 @@ def rebuild_base_length_driver(muscle_obj):
     while driver.variables:
         driver.variables.remove(driver.variables[0])
 
-    rot_var = driver.variables.new()
-    rot_var.name = "rot"
-    rot_var.type = "TRANSFORMS"
-    rot_target = rot_var.targets[0]
-    rot_target.id = rig_obj
-    rot_target.bone_target = source_bone_name
-    rot_target.transform_type = rotation_transform_type(rotation_axis)
-    rot_target.transform_space = rotation_space
+    axes = normalize_axis_flags(rotation_axes)
+    var_names = []
+    for axis_name in axes:
+        rot_var = driver.variables.new()
+        var_name = f"r{axis_name.lower()}"
+        rot_var.name = var_name
+        rot_var.type = "TRANSFORMS"
+        rot_target = rot_var.targets[0]
+        rot_target.id = rig_obj
+        rot_target.bone_target = source_bone_name
+        rot_target.transform_type = rotation_transform_type(axis_name)
+        rot_target.transform_space = rotation_space
+        var_names.append(var_name)
 
     factor_var = driver.variables.new()
     factor_var.name = "factor"
@@ -879,7 +970,7 @@ def rebuild_base_length_driver(muscle_obj):
     zero_target.id = muscle_sys
     zero_target.data_path = '["xmuscle_length_driver_zero"]'
 
-    driver.expression = f"base + ({driver_expression_for_mode(driver_mode)})"
+    driver.expression = f"base + ({driver_expression_for_mode(driver_mode, combined_rotation_expression(var_names, combine_mode))})"
     return True, muscle_sys.name
 
 
@@ -927,7 +1018,8 @@ def selected_driver_settings_changed(self, _context):
         if rig_obj and slide_bone_name in rig_obj.pose.bones:
             pose_bone = rig_obj.pose.bones[slide_bone_name]
             pose_bone["xmuscle_slide_axis"] = self.selected_slide_driver_slide_axis
-            pose_bone["xmuscle_rotation_axis"] = self.selected_slide_driver_rotation_axis
+            pose_bone["xmuscle_rotation_axes"] = json.dumps(normalize_axis_flags(self.selected_slide_driver_rotation_axes))
+            pose_bone["xmuscle_rotation_combine_mode"] = self.selected_slide_driver_combine_mode
             pose_bone["xmuscle_slide_factor"] = self.selected_slide_driver_factor
             pose_bone["xmuscle_rotation_space"] = self.selected_slide_driver_rotation_space
             pose_bone["xmuscle_slide_driver_mode"] = self.selected_slide_driver_mode
@@ -936,7 +1028,8 @@ def selected_driver_settings_changed(self, _context):
 
     muscle_sys = get_muscle_system(muscle_obj)
     if self.selected_has_length_driver and muscle_sys is not None:
-        muscle_sys["xmuscle_length_driver_axis"] = self.selected_length_driver_rotation_axis
+        muscle_sys["xmuscle_length_driver_axes"] = json.dumps(normalize_axis_flags(self.selected_length_driver_rotation_axes))
+        muscle_sys["xmuscle_length_driver_combine_mode"] = self.selected_length_driver_combine_mode
         muscle_sys["xmuscle_length_driver_factor"] = self.selected_length_driver_factor
         muscle_sys["xmuscle_length_driver_space"] = self.selected_length_driver_rotation_space
         muscle_sys["xmuscle_length_driver_mode"] = self.selected_length_driver_mode
@@ -1935,11 +2028,19 @@ class XMRB_Settings(bpy.types.PropertyGroup):
         default="Y",
         update=settings_changed,
     )
-    slide_driver_rotation_axis: EnumProperty(
-        name="Source Rotation Axis",
-        description="Which local rotation axis of the second selected bone should drive the slide motion",
-        items=AXIS_ITEMS,
-        default="X",
+    slide_driver_rotation_axes: EnumProperty(
+        name="Source Rotation Axes",
+        description="Which local rotation axes of the second selected bone should drive the slide motion",
+        items=AXIS_FLAG_ITEMS,
+        options={"ENUM_FLAG"},
+        default={"X"},
+        update=settings_changed,
+    )
+    slide_driver_combine_mode: EnumProperty(
+        name="Slide Combine",
+        description="How multiple selected source rotation axes should be combined for the slide driver",
+        items=COMBINE_MODE_ITEMS,
+        default="SUM",
         update=settings_changed,
     )
     slide_driver_factor: FloatProperty(
@@ -1958,11 +2059,19 @@ class XMRB_Settings(bpy.types.PropertyGroup):
         default=False,
         update=settings_changed,
     )
-    length_driver_rotation_axis: EnumProperty(
-        name="Length Rotation Axis",
-        description="Which local rotation axis of the original second selected bone should drive the X-Muscle Base Length",
-        items=AXIS_ITEMS,
-        default="X",
+    length_driver_rotation_axes: EnumProperty(
+        name="Length Rotation Axes",
+        description="Which local rotation axes of the original second selected bone should drive the X-Muscle Base Length",
+        items=AXIS_FLAG_ITEMS,
+        options={"ENUM_FLAG"},
+        default={"X"},
+        update=settings_changed,
+    )
+    length_driver_combine_mode: EnumProperty(
+        name="Length Combine",
+        description="How multiple selected source rotation axes should be combined for the Base Length driver",
+        items=COMBINE_MODE_ITEMS,
+        default="SUM",
         update=settings_changed,
     )
     length_driver_factor: FloatProperty(
@@ -1986,11 +2095,19 @@ class XMRB_Settings(bpy.types.PropertyGroup):
         default="Y",
         update=selected_driver_settings_changed,
     )
-    selected_slide_driver_rotation_axis: EnumProperty(
-        name="Slide Driver Rotation Axis",
-        description="Edit which local rotation axis drives the selected muscle's helper slide bone",
-        items=AXIS_ITEMS,
-        default="X",
+    selected_slide_driver_rotation_axes: EnumProperty(
+        name="Slide Driver Rotation Axes",
+        description="Edit which local rotation axes drive the selected muscle's helper slide bone",
+        items=AXIS_FLAG_ITEMS,
+        options={"ENUM_FLAG"},
+        default={"X"},
+        update=selected_driver_settings_changed,
+    )
+    selected_slide_driver_combine_mode: EnumProperty(
+        name="Slide Driver Combine",
+        description="Choose how multiple slide-driver source axes combine on the selected muscle",
+        items=COMBINE_MODE_ITEMS,
+        default="SUM",
         update=selected_driver_settings_changed,
     )
     selected_slide_driver_factor: FloatProperty(
@@ -2030,11 +2147,19 @@ class XMRB_Settings(bpy.types.PropertyGroup):
         name="Has Length Driver",
         default=False,
     )
-    selected_length_driver_rotation_axis: EnumProperty(
-        name="Length Driver Rotation Axis",
-        description="Edit which local rotation axis drives the selected muscle's X-Muscle Base Length",
-        items=AXIS_ITEMS,
-        default="X",
+    selected_length_driver_rotation_axes: EnumProperty(
+        name="Length Driver Rotation Axes",
+        description="Edit which local rotation axes drive the selected muscle's X-Muscle Base Length",
+        items=AXIS_FLAG_ITEMS,
+        options={"ENUM_FLAG"},
+        default={"X"},
+        update=selected_driver_settings_changed,
+    )
+    selected_length_driver_combine_mode: EnumProperty(
+        name="Length Driver Combine",
+        description="Choose how multiple Base Length source axes combine on the selected muscle",
+        items=COMBINE_MODE_ITEMS,
+        default="SUM",
         update=selected_driver_settings_changed,
     )
     selected_length_driver_factor: FloatProperty(
@@ -2222,7 +2347,8 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
                         ordered_bones[1],
                         helper_base_name,
                         settings.slide_driver_slide_axis,
-                        settings.slide_driver_rotation_axis,
+                        settings.slide_driver_rotation_axes,
+                        settings.slide_driver_combine_mode,
                         settings.slide_driver_factor,
                     )
                     if not ok:
@@ -2292,7 +2418,8 @@ class XMRB_OT_add_muscle(bpy.types.Operator):
                         created_muscle,
                         rig_obj,
                         length_driver_source_bone_name,
-                        settings.length_driver_rotation_axis,
+                        settings.length_driver_rotation_axes,
+                        settings.length_driver_combine_mode,
                         settings.length_driver_factor,
                     )
                     if ok:
@@ -2650,9 +2777,14 @@ class XMRB_OT_capture_driver_zero(bpy.types.Operator):
                     return {"CANCELLED"}
                 slide_bone = rig_obj.pose.bones[slide_bone_name]
                 source_bone_name = slide_bone.get("xmuscle_slide_source_bone", "")
-                axis_name = slide_bone.get("xmuscle_rotation_axis", "X")
+                raw_axes = slide_bone.get("xmuscle_rotation_axes", "")
+                try:
+                    axes = json.loads(raw_axes) if raw_axes else [slide_bone.get("xmuscle_rotation_axis", "X")]
+                except Exception:
+                    axes = [slide_bone.get("xmuscle_rotation_axis", "X")]
+                combine_mode = slide_bone.get("xmuscle_rotation_combine_mode", "SUM")
                 rotation_space = slide_bone.get("xmuscle_rotation_space", "LOCAL_SPACE")
-                zero_value = sample_bone_rotation_channel(rig_obj, source_bone_name, axis_name, rotation_space)
+                zero_value = sample_combined_bone_rotation(rig_obj, source_bone_name, axes, rotation_space, combine_mode)
                 slide_bone["xmuscle_slide_zero"] = zero_value
                 settings.selected_slide_driver_zero = zero_value
                 rebuild_slide_driver(rig_obj, slide_bone_name)
@@ -2662,9 +2794,14 @@ class XMRB_OT_capture_driver_zero(bpy.types.Operator):
                     self.report({"ERROR"}, "Selected muscle has no Base Length driver")
                     return {"CANCELLED"}
                 source_bone_name = muscle_sys.get("xmuscle_length_driver_source_bone", "")
-                axis_name = muscle_sys.get("xmuscle_length_driver_axis", "X")
+                raw_axes = muscle_sys.get("xmuscle_length_driver_axes", "")
+                try:
+                    axes = json.loads(raw_axes) if raw_axes else [muscle_sys.get("xmuscle_length_driver_axis", "X")]
+                except Exception:
+                    axes = [muscle_sys.get("xmuscle_length_driver_axis", "X")]
+                combine_mode = muscle_sys.get("xmuscle_length_driver_combine_mode", "SUM")
                 rotation_space = muscle_sys.get("xmuscle_length_driver_space", "LOCAL_SPACE")
-                zero_value = sample_bone_rotation_channel(rig_obj, source_bone_name, axis_name, rotation_space)
+                zero_value = sample_combined_bone_rotation(rig_obj, source_bone_name, axes, rotation_space, combine_mode)
                 muscle_sys["xmuscle_length_driver_zero"] = zero_value
                 settings.selected_length_driver_zero = zero_value
                 rebuild_base_length_driver(muscle_obj)
