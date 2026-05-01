@@ -9,7 +9,7 @@ from .ui import UI_CLASSES
 bl_info = {
     "name": "xmuscles orbit helper",
     "author": "blackorbit",
-    "version": (0, 6, 2),
+    "version": (0, 7, 0),
     "blender": (5, 0, 0),
     "location": "View3D > Sidebar > X-Muscles Orbit",
     "description": "Muscle-centric helper for baking and rebaking X-Muscle deformation into shape keys",

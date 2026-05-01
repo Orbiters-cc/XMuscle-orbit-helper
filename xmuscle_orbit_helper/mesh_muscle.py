@@ -2,7 +2,7 @@ import bpy
 from bpy.props import StringProperty
 
 from . import core
-from .drawn_muscle import (
+from .drawn_helpers import (
     _convert_mesh_to_xmuscle,
     _find_muscle_controller,
     _object_world_vertices,

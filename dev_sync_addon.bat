@@ -6,6 +6,8 @@ set "SRC=%ROOT%xmuscle_orbit_helper"
 set "DST=%APPDATA%\Blender Foundation\Blender\5.0\scripts\addons\xmuscle_orbit_helper"
 
 if exist "%DST%" rmdir /s /q "%DST%"
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "Get-ChildItem -Path '%SRC%' -Directory -Recurse -Filter '__pycache__' -ErrorAction SilentlyContinue | ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }"
 xcopy "%SRC%" "%DST%\" /e /i /y >nul
 
 if errorlevel 1 (
