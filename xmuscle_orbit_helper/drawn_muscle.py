@@ -18,6 +18,10 @@ MAX_SMOOTHING_LEVELS = 4
 SLIDER_WIDTH = 360
 SLIDER_HEIGHT = 18
 SLIDER_TOP_OFFSET = 116
+XMSL_DEFAULT_MUSCLE_LENGTH = 5.16
+XMSL_DEFAULT_CUSTOM_SHAPE_SCALE = 5.0
+CONTROL_EMPTY_WORLD_SIZE_FACTOR = 0.025
+SYSTEM_CUSTOM_SHAPE_DISPLAY_BOOST = 1.45
 
 
 def _mouse_coord(event):
@@ -181,6 +185,53 @@ def _restore_object_world_vertices(obj, world_coords):
 
     obj.data.update()
     return True
+
+
+def _bounds_max_extent(world_coords):
+    if not world_coords:
+        return XMSL_DEFAULT_MUSCLE_LENGTH
+    min_x = min(co.x for co in world_coords)
+    min_y = min(co.y for co in world_coords)
+    min_z = min(co.z for co in world_coords)
+    max_x = max(co.x for co in world_coords)
+    max_y = max(co.y for co in world_coords)
+    max_z = max(co.z for co in world_coords)
+    return max(max_x - min_x, max_y - min_y, max_z - min_z)
+
+
+def _object_world_scale_max(obj):
+    if obj is None:
+        return 1.0
+    scale = obj.matrix_world.to_scale()
+    return max(abs(scale.x), abs(scale.y), abs(scale.z), 1e-6)
+
+
+def _set_pose_bone_custom_shape_display_size(pose_bone, display_scale):
+    if pose_bone.custom_shape is None:
+        return
+    if hasattr(pose_bone, "custom_shape_scale_xyz"):
+        pose_bone.custom_shape_scale_xyz = (display_scale, display_scale, display_scale)
+    elif hasattr(pose_bone, "custom_shape_scale"):
+        pose_bone.custom_shape_scale = display_scale
+
+
+def _normalize_xmuscle_control_display(muscle_obj, world_coords):
+    mesh_extent = max(0.001, _bounds_max_extent(world_coords))
+    display_factor = max(0.02, mesh_extent / XMSL_DEFAULT_MUSCLE_LENGTH)
+    empty_world_size = max(0.01, mesh_extent * CONTROL_EMPTY_WORLD_SIZE_FACTOR)
+    custom_shape_size = XMSL_DEFAULT_CUSTOM_SHAPE_SCALE * display_factor * SYSTEM_CUSTOM_SHAPE_DISPLAY_BOOST
+
+    controller = _find_muscle_controller(muscle_obj)
+    if controller is not None and hasattr(controller, "empty_display_size"):
+        controller.empty_display_size = empty_world_size / _object_world_scale_max(controller)
+
+    muscle_sys = core.get_muscle_system(muscle_obj)
+    if muscle_sys is not None:
+        if hasattr(muscle_sys, "empty_display_size"):
+            muscle_sys.empty_display_size = empty_world_size / _object_world_scale_max(muscle_sys)
+        if getattr(muscle_sys, "type", None) == "ARMATURE":
+            for pose_bone in muscle_sys.pose.bones:
+                _set_pose_bone_custom_shape_display_size(pose_bone, custom_shape_size)
 
 
 def _set_font_size(font_id, size):
@@ -607,6 +658,7 @@ class XMRB_OT_draw_muscle(bpy.types.Operator):
         if not _restore_object_world_vertices(muscle_obj, source_world_coords):
             self.report({"WARNING"}, "Drawn mesh placement could not be restored after X-Muscle conversion")
 
+        _normalize_xmuscle_control_display(muscle_obj, source_world_coords)
         core.set_muscle_visibility_mode(muscle_obj, "SHOW_THROUGH")
 
         body_obj = core.ensure_default_body_object(self.settings, context.scene)

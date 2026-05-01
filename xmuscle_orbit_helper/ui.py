@@ -46,6 +46,12 @@ class XMRB_PT_panel(bpy.types.Panel):
         add_op = add_row.operator("xmuscle_baker.add_muscle", text="Flat", icon="MESH_PLANE")
         add_op.muscle_type = "STRIP"
         add_row.operator("xmuscle_baker.draw_muscle", text="Drawn", icon="GREASEPENCIL")
+        add_row.operator("xmuscle_baker.toggle_mesh_muscle_creator", text="Mesh", icon="MESH_DATA")
+        if settings.show_mesh_muscle_creator:
+            mesh_box = col.box()
+            mesh_box.prop(settings, "mesh_source_object", text="Mesh")
+            confirm = mesh_box.operator("xmuscle_baker.create_mesh_muscle", text="Confirm", icon="CHECKMARK")
+            confirm.source_name = settings.mesh_source_object.name if settings.mesh_source_object else ""
         col.separator()
         col.label(text="Scene Muscles")
         if not muscles:
