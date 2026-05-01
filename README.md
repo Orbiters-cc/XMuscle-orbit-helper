@@ -5,7 +5,7 @@ It adds muscle-centric creation, preview, baking, and cleanup tools around the o
 
 ## What It Does
 
-- Creates X-Muscles from five workflows: Normal, Curved, Flat, Drawn-on-body, and Custom Mesh.
+- Creates X-Muscles from six workflows: Normal, Curved, Flat, Drawn-on-body, Custom Mesh, and Mesh Bone.
 - Auto-applies newly created muscles to the selected body mesh, defaulting to a mesh named `Body` when available.
 - Adds optional helper drivers when creating a muscle from two selected bones:
   - Slide driver bone: creates a helper bone attached to the first selected bone and driven by the second selected bone rotation.
@@ -35,9 +35,22 @@ This avoids repeatedly reinstalling the zip.
    - `Normal`, `Curved`, `Flat`: delegate to X-Muscle Auto Aim/basic creation.
    - `Drawn`: draw a closed shape on the body, pick start/end attachment points, adjust smoothing, then convert.
    - `Mesh`: choose an existing mesh object and convert it into an X-Muscle.
+   - `Bone`: choose an existing mesh object, select one armature bone, and convert the mesh into a white X-Muscle bone.
 4. Edit per-muscle bake settings from the Scene Muscles list.
 5. Bake selected muscles into shape keys.
 6. Use the generated preview action button to inspect the result.
+
+## Mesh Bone Workflow
+
+The `Bone` button is for rigid helper anatomy built from a custom mesh, such as a stylized bone or hard internal support shape.
+
+1. Select one armature bone in Pose Mode.
+2. Click `Bone` in the Add Muscle section.
+3. Choose the mesh to convert.
+4. Click `Confirm`.
+
+The addon converts the mesh into an X-Muscle object, then places and parents both the X-Muscle System and Ctrl controls to the selected armature bone.
+The generated muscle mesh is assigned a white material so it reads visually as a bone instead of a muscle.
 
 ## Architecture
 
@@ -58,6 +71,7 @@ The addon is intentionally split by role. Keep files focused and small.
 - `drawn_helpers.py`: Drawn/mesh conversion helpers, generated mesh geometry, viewport drawing primitives, X-Muscle conversion utilities.
 - `drawn_muscle.py`: Modal Drawn muscle workflow only.
 - `mesh_muscle.py`: Custom Mesh muscle workflow only.
+- `bone_muscle.py`: Mesh Bone workflow, selected-bone System/Ctrl parenting, and white material assignment.
 
 ## Development Checks
 
@@ -66,6 +80,7 @@ Run these before handing off changes:
 ```powershell
 $files = @(
   '.\xmuscle_orbit_helper\core.py',
+  '.\xmuscle_orbit_helper\bone_muscle.py',
   '.\xmuscle_orbit_helper\mesh_muscle.py',
   '.\xmuscle_orbit_helper\drawn_helpers.py',
   '.\xmuscle_orbit_helper\drawn_muscle.py',
@@ -91,3 +106,4 @@ Then run:
 - The original `xmusclesystem` folder is intentionally ignored by git.
 - `.blend` and `.fbx` files are ignored because they are large local test assets.
 - Do not scale X-Muscle system/controller objects to make handles smaller; use display-only settings such as `empty_display_size` and pose-bone custom-shape display scale.
+- Mesh Bone creation intentionally avoids pins; it keeps the X-Muscle System and Ctrl close together on the selected bone so the converted mesh is driven without being collapsed.

@@ -13,10 +13,21 @@ class XMRB_Settings(bpy.types.PropertyGroup):
         description="Show the custom mesh X-Muscle conversion controls",
         default=False,
     )
+    show_bone_muscle_creator: BoolProperty(
+        name="Show Mesh Bone Creator",
+        description="Show the mesh-as-bone X-Muscle conversion controls",
+        default=False,
+    )
     mesh_source_object: PointerProperty(
         name="Custom Mesh",
         type=bpy.types.Object,
         description="Mesh object to convert into an X-Muscle while preserving helper driver support",
+        poll=lambda _self, obj: obj and obj.type == "MESH" and not getattr(obj, "Muscle_XID", False),
+    )
+    bone_source_object: PointerProperty(
+        name="Bone Mesh",
+        type=bpy.types.Object,
+        description="Mesh object to convert into a pinned X-Muscle bone attached to the selected armature bone",
         poll=lambda _self, obj: obj and obj.type == "MESH" and not getattr(obj, "Muscle_XID", False),
     )
     rig_object: PointerProperty(

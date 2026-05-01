@@ -16,6 +16,7 @@ Keep the addon maintainable. Do not re-create giant files or anonymous numbered 
   - Muscle management operators in `core_modules/muscle_operators.py`.
   - Bake/capture operators in `core_modules/bake_operators.py`.
   - Mesh conversion operators in `mesh_muscle.py`.
+  - Mesh-as-bone conversion operators in `bone_muscle.py`.
 - Keep pure or mostly-pure helpers grouped by domain:
   - Queries and naming in `core_modules/foundation.py`.
   - Settings persistence in `core_modules/selection_settings.py`.
@@ -42,6 +43,7 @@ Avoid splitting by arbitrary line count; split by responsibility.
 - Do not edit the original `xmusclesystem` addon unless explicitly requested.
 - Prefer wrapping or compensating for X-Muscle behavior from this addon.
 - Do not scale X-Muscle system/controller objects to change handle size. Object scale affects muscle behavior. Use display-only fields such as `empty_display_size` or pose-bone custom-shape display scale.
+- Mesh Bone creation must not add pins. Parent the X-Muscle System and Ctrl to the selected armature bone with a tiny non-zero separation and do not scale the converted muscle object.
 - Preserve user-created scene data. Temporary objects must be removed on success, cancellation, and failure.
 - Any deletion workflow must remain undoable.
 
@@ -60,6 +62,7 @@ Run these before finishing changes:
 ```powershell
 $files = @(
   '.\xmuscle_orbit_helper\core.py',
+  '.\xmuscle_orbit_helper\bone_muscle.py',
   '.\xmuscle_orbit_helper\mesh_muscle.py',
   '.\xmuscle_orbit_helper\drawn_helpers.py',
   '.\xmuscle_orbit_helper\drawn_muscle.py',

@@ -53,6 +53,15 @@ class XMRB_PT_panel(bpy.types.Panel):
             confirm = mesh_box.operator("xmuscle_baker.create_mesh_muscle", text="Confirm", icon="CHECKMARK")
             confirm.source_name = settings.mesh_source_object.name if settings.mesh_source_object else ""
         col.separator()
+        col.label(text="Add Bone")
+        col.operator("xmuscle_baker.toggle_bone_muscle_creator", text="Bone", icon="BONE_DATA")
+        if settings.show_bone_muscle_creator:
+            bone_box = col.box()
+            bone_box.prop(settings, "bone_source_object", text="Mesh")
+            bone_box.label(text="Select one armature bone, then confirm", icon="BONE_DATA")
+            confirm = bone_box.operator("xmuscle_baker.create_bone_muscle", text="Confirm", icon="CHECKMARK")
+            confirm.source_name = settings.bone_source_object.name if settings.bone_source_object else ""
+        col.separator()
         col.label(text="Scene Muscles")
         if not muscles:
             col.label(text="No X-Muscles found")

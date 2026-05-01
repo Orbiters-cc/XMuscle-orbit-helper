@@ -108,6 +108,7 @@ def delete_muscle_system(context, muscle_obj, key_prefix):
     scene = context.scene
     muscle_name = muscle_obj.name
     slide_bone_name = muscle_obj.get("xmuscle_orbit_slide_bone", "")
+    bone_helper_name = muscle_obj.get("xmuscle_orbit_bone_helper", "")
     body_obj = infer_body_for_muscle(scene, muscle_obj)
     links = infer_links_for_muscle(scene, muscle_obj)
     rig_obj = bpy.data.objects.get(links["rig_object_name"]) if links.get("rig_object_name") else None
@@ -129,6 +130,8 @@ def delete_muscle_system(context, muscle_obj, key_prefix):
 
     if slide_bone_name:
         delete_bone_by_name(context, rig_obj, slide_bone_name)
+    if bone_helper_name:
+        delete_bone_by_name(context, rig_obj, bone_helper_name)
 
     return True, f"Deleted {muscle_name}"
 

@@ -287,6 +287,18 @@ def _remove_temp_mesh_object(obj):
         bpy.data.meshes.remove(mesh)
 
 
+def _duplicate_mesh_as_world_source(context, source_obj, name):
+    depsgraph = context.evaluated_depsgraph_get()
+    eval_obj = source_obj.evaluated_get(depsgraph)
+    mesh = bpy.data.meshes.new_from_object(eval_obj, depsgraph=depsgraph)
+    mesh.transform(source_obj.matrix_world)
+    mesh.update()
+    obj = bpy.data.objects.new(name, mesh)
+    context.scene.collection.objects.link(obj)
+    obj.show_in_front = True
+    return obj
+
+
 def _parent_object_to_bone(context, obj, rig_obj, bone_name, world_location):
     if obj is None or rig_obj is None or bone_name not in rig_obj.pose.bones:
         return False
